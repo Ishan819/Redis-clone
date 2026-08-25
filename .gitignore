@@ -1,0 +1,3 @@
+/bin/
+*.rdb
+.claude/settings.local.json
