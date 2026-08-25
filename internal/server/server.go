@@ -16,17 +16,20 @@ import (
 
 	"github.com/Ishan819/Redis-clone/internal/command"
 	"github.com/Ishan819/Redis-clone/internal/resp"
+	"github.com/Ishan819/Redis-clone/internal/store"
 )
 
-// Server is a minimal RESP-speaking TCP server.
+// Server is a minimal RESP-speaking TCP server. All connections share a
+// single in-memory Store.
 type Server struct {
-	Addr string
+	Addr  string
+	store *store.Store
 }
 
 // New returns a Server that will listen on addr (e.g. ":6379") once
 // ListenAndServe is called.
 func New(addr string) *Server {
-	return &Server{Addr: addr}
+	return &Server{Addr: addr, store: store.New()}
 }
 
 // ListenAndServe binds Addr and serves connections until the listener
@@ -78,7 +81,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			continue
 		}
 
-		reply := handler(args[1:])
+		reply := handler(s.store, args[1:])
 		if _, err := conn.Write(reply.Marshal()); err != nil {
 			log.Printf("redis-clone: write error: %v", err)
 			return
