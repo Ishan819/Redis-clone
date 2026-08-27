@@ -13,6 +13,7 @@ import (
 	"math"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/Ishan819/Redis-clone/internal/skiplist"
 )
@@ -38,13 +39,16 @@ const (
 )
 
 // entry is the store's internal representation of one key's value. Only
-// the field matching kind is populated.
+// the field matching kind is populated. expireAt is the key's TTL
+// deadline; the zero Time value means "no expiry", matching how a
+// never-set time.Time already reads as "not a real time" via IsZero.
 type entry struct {
-	kind kind
-	str  string
-	hash map[string]string
-	list []string
-	zset *zsetValue
+	kind     kind
+	str      string
+	hash     map[string]string
+	list     []string
+	zset     *zsetValue
+	expireAt time.Time
 }
 
 // zsetValue is a sorted set: a skiplist.SkipList giving ordered access
@@ -68,37 +72,223 @@ type ZMember struct {
 }
 
 // Store is a thread-safe in-memory key-value store supporting strings,
-// hashes, and lists. The zero value is not usable; construct one with New.
-// A single mutex guards the whole map for now — fine at this scale, and
-// simple to reason about while later phases (TTL, more data types) still
-// land on top of it.
+// hashes, lists, and sorted sets, with optional per-key TTLs. The zero
+// value is not usable; construct one with New. A single mutex guards the
+// whole map for now — fine at this scale, and simple to reason about.
+//
+// Expiry has two halves, matching Redis:
+//   - Lazy: every accessor treats an expired key as absent (via lookup
+//     below), so a stale key is never visibly returned even if the active
+//     sweep hasn't reclaimed it yet.
+//   - Active: StartActiveExpiry runs a background goroutine that
+//     periodically samples keysWithTTL and deletes anything expired, so
+//     memory for expired keys is reclaimed even if nothing ever reads
+//     them again.
+//
+// keysWithTTL tracks which keys currently have a TTL set, so the active
+// sweep only has to examine those keys instead of the whole keyspace.
+// setEntry and deleteKey are the only places that mutate s.data, and both
+// keep keysWithTTL in sync — every other method must go through them
+// rather than touching s.data directly.
 type Store struct {
-	mu   sync.RWMutex
-	data map[string]entry
+	mu          sync.RWMutex
+	data        map[string]entry
+	keysWithTTL map[string]struct{}
 }
 
-// New returns an empty, ready-to-use Store.
+// New returns an empty, ready-to-use Store. Active expiry is not started
+// automatically; call StartActiveExpiry if it's wanted.
 func New() *Store {
-	return &Store{data: make(map[string]entry)}
+	return &Store{
+		data:        make(map[string]entry),
+		keysWithTTL: make(map[string]struct{}),
+	}
+}
+
+// expired reports whether e's TTL (if any) has passed as of now.
+func expired(e entry, now time.Time) bool {
+	return !e.expireAt.IsZero() && !e.expireAt.After(now)
+}
+
+// lookup returns the live (non-expired) entry at key, treating an expired
+// key as absent. Callers holding only the read lock must pass
+// purge=false, since reclaiming the expired entry from the maps requires
+// the write lock; callers holding the write lock should pass purge=true
+// so expired keys are cleaned up as they're discovered (this is the lazy
+// half of expiry).
+func (s *Store) lookup(key string, purge bool) (entry, bool) {
+	e, ok := s.data[key]
+	if !ok {
+		return entry{}, false
+	}
+	if expired(e, time.Now()) {
+		if purge {
+			s.deleteKey(key)
+		}
+		return entry{}, false
+	}
+	return e, true
+}
+
+// setEntry stores e under key and keeps keysWithTTL in sync with e's TTL.
+// Every write of s.data must go through this (or deleteKey) rather than
+// assigning s.data[key] directly, or the active-expiry sample set would
+// drift out of sync with reality. Callers must hold the write lock.
+func (s *Store) setEntry(key string, e entry) {
+	s.data[key] = e
+	if e.expireAt.IsZero() {
+		delete(s.keysWithTTL, key)
+	} else {
+		s.keysWithTTL[key] = struct{}{}
+	}
+}
+
+// deleteKey removes key from the store entirely. Callers must hold the
+// write lock.
+func (s *Store) deleteKey(key string) {
+	delete(s.data, key)
+	delete(s.keysWithTTL, key)
+}
+
+// --- Expiry ---
+
+// Expire sets key's remaining time to live to ttl, matching Redis's
+// EXPIRE. If ttl is zero or negative, key is deleted immediately (Redis
+// treats an already-past expiry as an immediate delete). It reports
+// whether key existed. Expire applies regardless of key's type.
+func (s *Store) Expire(key string, ttl time.Duration) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.lookup(key, true)
+	if !ok {
+		return false
+	}
+	if ttl <= 0 {
+		s.deleteKey(key)
+		return true
+	}
+	e.expireAt = time.Now().Add(ttl)
+	s.setEntry(key, e)
+	return true
+}
+
+// TTLSeconds returns key's remaining time to live in whole seconds
+// (rounded up), following Redis's TTL command semantics: -2 if key
+// doesn't exist (or has already expired), -1 if key exists but has no
+// TTL, otherwise the number of seconds remaining.
+func (s *Store) TTLSeconds(key string) int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e, ok := s.lookup(key, false)
+	if !ok {
+		return -2
+	}
+	if e.expireAt.IsZero() {
+		return -1
+	}
+	remaining := time.Until(e.expireAt)
+	if remaining < 0 {
+		remaining = 0
+	}
+	return int64(math.Ceil(remaining.Seconds()))
+}
+
+// Persist removes key's TTL, if it has one, making it persist forever
+// until otherwise deleted. It reports whether a TTL was actually removed
+// (false if key doesn't exist or already had no TTL), matching Redis's
+// PERSIST return value. Persist applies regardless of key's type.
+func (s *Store) Persist(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.lookup(key, true)
+	if !ok || e.expireAt.IsZero() {
+		return false
+	}
+	e.expireAt = time.Time{}
+	s.setEntry(key, e)
+	return true
+}
+
+// StartActiveExpiry launches a background goroutine that wakes every
+// interval and sweeps a bounded sample of keys with a TTL set, deleting
+// any that have expired — Redis's "active expire cycle", reclaiming
+// memory for expired keys that are never accessed again (lazy expiry
+// alone only hides them on access; it never frees them). It returns a
+// stop function that halts the goroutine; callers should call it during
+// shutdown, and tests that start active expiry must call it to avoid
+// leaking the goroutine.
+func (s *Store) StartActiveExpiry(interval time.Duration) (stop func()) {
+	stopCh := make(chan struct{})
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ticker.C:
+				s.sweepExpired()
+			}
+		}
+	}()
+	return func() { close(stopCh) }
+}
+
+// activeExpirySampleSize bounds how many keys-with-TTL a single sweep
+// examines, mirroring Redis's own sampling-based active expire cycle
+// (which also examines a bounded sample per pass) rather than scanning
+// the whole keyspace on every tick.
+const activeExpirySampleSize = 20
+
+// sweepExpired examines a sample of keysWithTTL and deletes any that have
+// expired. Go's map iteration order is randomized per-iteration by the
+// runtime, so simply taking the first activeExpirySampleSize entries
+// visited already gives a pseudo-random sample without any extra
+// bookkeeping.
+func (s *Store) sweepExpired() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	sampled := 0
+	for key := range s.keysWithTTL {
+		if sampled >= activeExpirySampleSize {
+			break
+		}
+		sampled++
+		if e, ok := s.data[key]; ok && expired(e, now) {
+			s.deleteKey(key)
+		}
+	}
 }
 
 // --- Strings ---
 
 // Set stores value as a string under key, overwriting any existing value
-// regardless of its type — matching Redis, where SET always replaces
-// whatever was there.
+// regardless of its type and clearing any TTL it had — matching Redis,
+// where a plain SET always replaces whatever was there and drops any
+// prior expiry. Use SetEx for SET ... EX/PX.
 func (s *Store) Set(key, value string) {
+	s.SetEx(key, value, 0)
+}
+
+// SetEx is SET key value with an optional expiry (SET ... EX/PX). A zero
+// or negative ttl means no expiry, matching plain SET.
+func (s *Store) SetEx(key, value string, ttl time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data[key] = entry{kind: kindString, str: value}
+	e := entry{kind: kindString, str: value}
+	if ttl > 0 {
+		e.expireAt = time.Now().Add(ttl)
+	}
+	s.setEntry(key, e)
 }
 
 // Get returns the string stored at key and whether it was present. It
-// fails with errWrongType if key holds a hash or list.
+// fails with errWrongType if key holds a hash, list, or zset.
 func (s *Store) Get(key string) (string, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	e, ok := s.data[key]
+	e, ok := s.lookup(key, false)
 	if !ok {
 		return "", false, nil
 	}
@@ -109,14 +299,15 @@ func (s *Store) Get(key string) (string, bool, error) {
 }
 
 // Del removes each of keys, if present, regardless of type, and returns
-// how many were actually deleted (Redis's DEL return value).
+// how many were actually deleted (Redis's DEL return value). An expired
+// key is treated as already absent and doesn't count.
 func (s *Store) Del(keys ...string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	count := 0
 	for _, k := range keys {
-		if _, ok := s.data[k]; ok {
-			delete(s.data, k)
+		if _, ok := s.lookup(k, true); ok {
+			s.deleteKey(k)
 			count++
 		}
 	}
@@ -125,13 +316,13 @@ func (s *Store) Del(keys ...string) int {
 
 // Exists returns how many of keys are currently present, regardless of
 // type. Redis counts a key multiple times if it's repeated in the
-// argument list, so this does too.
+// argument list, so this does too. An expired key doesn't count.
 func (s *Store) Exists(keys ...string) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	count := 0
 	for _, k := range keys {
-		if _, ok := s.data[k]; ok {
+		if _, ok := s.lookup(k, false); ok {
 			count++
 		}
 	}
@@ -140,15 +331,17 @@ func (s *Store) Exists(keys ...string) int {
 
 // IncrBy atomically adds delta to the integer value stored at key (treating
 // a missing key as 0) and stores + returns the result. It fails if key
-// holds a hash or list, if the existing string value isn't a base-10
-// int64, or if the addition would overflow int64 — all matching Redis's
-// INCR/DECR/INCRBY/DECRBY behavior.
+// holds a hash, list, or zset, if the existing string value isn't a
+// base-10 int64, or if the addition would overflow int64 — all matching
+// Redis's INCR/DECR/INCRBY/DECRBY behavior. Any existing TTL on key is
+// preserved (INCR modifies a value in place; it isn't SET).
 func (s *Store) IncrBy(key string, delta int64) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	var cur int64
-	if e, ok := s.data[key]; ok {
+	var expireAt time.Time
+	if e, ok := s.lookup(key, true); ok {
 		if e.kind != kindString {
 			return 0, errWrongType
 		}
@@ -157,6 +350,7 @@ func (s *Store) IncrBy(key string, delta int64) (int64, error) {
 			return 0, errNotInteger
 		}
 		cur = n
+		expireAt = e.expireAt
 	}
 
 	if (delta > 0 && cur > math.MaxInt64-delta) || (delta < 0 && cur < math.MinInt64-delta) {
@@ -164,7 +358,7 @@ func (s *Store) IncrBy(key string, delta int64) (int64, error) {
 	}
 
 	next := cur + delta
-	s.data[key] = entry{kind: kindString, str: strconv.FormatInt(next, 10)}
+	s.setEntry(key, entry{kind: kindString, str: strconv.FormatInt(next, 10), expireAt: expireAt})
 	return next, nil
 }
 
@@ -181,26 +375,26 @@ func (s *Store) Decr(key string) (int64, error) {
 // Append appends value to the string stored at key (treating a missing key
 // as the empty string) and returns the length of the result, matching
 // Redis's APPEND return value. It fails with errWrongType if key holds a
-// hash or list.
+// hash, list, or zset. Any existing TTL on key is preserved.
 func (s *Store) Append(key, value string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	e, ok := s.data[key]
+	e, ok := s.lookup(key, true)
 	if ok && e.kind != kindString {
 		return 0, errWrongType
 	}
 	next := e.str + value
-	s.data[key] = entry{kind: kindString, str: next}
+	s.setEntry(key, entry{kind: kindString, str: next, expireAt: e.expireAt})
 	return len(next), nil
 }
 
 // Strlen returns the length of the string stored at key, or 0 if key
 // doesn't exist, matching Redis's STRLEN. It fails with errWrongType if
-// key holds a hash or list.
+// key holds a hash, list, or zset.
 func (s *Store) Strlen(key string) (int, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	e, ok := s.data[key]
+	e, ok := s.lookup(key, false)
 	if !ok {
 		return 0, nil
 	}
@@ -217,12 +411,12 @@ func (s *Store) Strlen(key string) (int, error) {
 // (field1, value1, field2, value2, ...) — callers validate arity before
 // calling. It returns the number of fields that were newly created (not
 // merely overwritten), matching Redis's HSET return value, and fails with
-// errWrongType if key holds a string or list.
+// errWrongType if key holds a string, list, or zset.
 func (s *Store) HSet(key string, pairs ...string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	e, ok := s.data[key]
+	e, ok := s.lookup(key, true)
 	if ok && e.kind != kindHash {
 		return 0, errWrongType
 	}
@@ -238,17 +432,17 @@ func (s *Store) HSet(key string, pairs ...string) (int, error) {
 		}
 		e.hash[field] = value
 	}
-	s.data[key] = e
+	s.setEntry(key, e)
 	return added, nil
 }
 
 // HGet returns the value of field in the hash at key, and whether it was
 // present. A missing key behaves like an empty hash (ok=false, no error).
-// It fails with errWrongType if key holds a string or list.
+// It fails with errWrongType if key holds a string, list, or zset.
 func (s *Store) HGet(key, field string) (string, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	e, ok := s.data[key]
+	e, ok := s.lookup(key, false)
 	if !ok {
 		return "", false, nil
 	}
@@ -262,11 +456,11 @@ func (s *Store) HGet(key, field string) (string, bool, error) {
 // HDel removes each of fields from the hash at key and returns how many
 // were actually removed. If the hash becomes empty, the key itself is
 // removed, matching Redis (a hash with no fields doesn't exist). It fails
-// with errWrongType if key holds a string or list.
+// with errWrongType if key holds a string, list, or zset.
 func (s *Store) HDel(key string, fields ...string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	e, ok := s.data[key]
+	e, ok := s.lookup(key, true)
 	if !ok {
 		return 0, nil
 	}
@@ -282,20 +476,20 @@ func (s *Store) HDel(key string, fields ...string) (int, error) {
 		}
 	}
 	if len(e.hash) == 0 {
-		delete(s.data, key)
+		s.deleteKey(key)
 	} else {
-		s.data[key] = e
+		s.setEntry(key, e)
 	}
 	return count, nil
 }
 
 // HGetAll returns a copy of all field/value pairs in the hash at key, or
 // an empty map if key doesn't exist. It fails with errWrongType if key
-// holds a string or list.
+// holds a string, list, or zset.
 func (s *Store) HGetAll(key string) (map[string]string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	e, ok := s.data[key]
+	e, ok := s.lookup(key, false)
 	if !ok {
 		return map[string]string{}, nil
 	}
@@ -310,11 +504,11 @@ func (s *Store) HGetAll(key string) (map[string]string, error) {
 }
 
 // HExists reports whether field is present in the hash at key. It fails
-// with errWrongType if key holds a string or list.
+// with errWrongType if key holds a string, list, or zset.
 func (s *Store) HExists(key, field string) (bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	e, ok := s.data[key]
+	e, ok := s.lookup(key, false)
 	if !ok {
 		return false, nil
 	}
@@ -326,11 +520,12 @@ func (s *Store) HExists(key, field string) (bool, error) {
 }
 
 // HLen returns the number of fields in the hash at key, or 0 if key
-// doesn't exist. It fails with errWrongType if key holds a string or list.
+// doesn't exist. It fails with errWrongType if key holds a string, list,
+// or zset.
 func (s *Store) HLen(key string) (int, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	e, ok := s.data[key]
+	e, ok := s.lookup(key, false)
 	if !ok {
 		return 0, nil
 	}
@@ -346,11 +541,11 @@ func (s *Store) HLen(key string) (int, error) {
 // at a time — so for LPush(key, "a", "b"), "b" ends up before "a" — and
 // returns the list's new length, matching Redis's LPUSH. It creates the
 // list if key doesn't exist, and fails with errWrongType if key holds a
-// string or hash.
+// string, hash, or zset.
 func (s *Store) LPush(key string, values ...string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	e, ok := s.data[key]
+	e, ok := s.lookup(key, true)
 	if ok && e.kind != kindList {
 		return 0, errWrongType
 	}
@@ -360,18 +555,18 @@ func (s *Store) LPush(key string, values ...string) (int, error) {
 	for _, v := range values {
 		e.list = append([]string{v}, e.list...)
 	}
-	s.data[key] = e
+	s.setEntry(key, e)
 	return len(e.list), nil
 }
 
 // RPush pushes each of values onto the tail (right) of the list at key, in
 // order, and returns the list's new length, matching Redis's RPUSH. It
 // creates the list if key doesn't exist, and fails with errWrongType if
-// key holds a string or hash.
+// key holds a string, hash, or zset.
 func (s *Store) RPush(key string, values ...string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	e, ok := s.data[key]
+	e, ok := s.lookup(key, true)
 	if ok && e.kind != kindList {
 		return 0, errWrongType
 	}
@@ -379,18 +574,18 @@ func (s *Store) RPush(key string, values ...string) (int, error) {
 		e = entry{kind: kindList}
 	}
 	e.list = append(e.list, values...)
-	s.data[key] = e
+	s.setEntry(key, e)
 	return len(e.list), nil
 }
 
 // LPop removes and returns the first element of the list at key. ok is
 // false if key doesn't exist or the list is empty (Redis returns nil in
 // both cases). If the list becomes empty, the key itself is removed. It
-// fails with errWrongType if key holds a string or hash.
+// fails with errWrongType if key holds a string, hash, or zset.
 func (s *Store) LPop(key string) (string, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	e, ok := s.data[key]
+	e, ok := s.lookup(key, true)
 	if !ok {
 		return "", false, nil
 	}
@@ -398,15 +593,15 @@ func (s *Store) LPop(key string) (string, bool, error) {
 		return "", false, errWrongType
 	}
 	if len(e.list) == 0 {
-		delete(s.data, key)
+		s.deleteKey(key)
 		return "", false, nil
 	}
 	v := e.list[0]
 	e.list = e.list[1:]
 	if len(e.list) == 0 {
-		delete(s.data, key)
+		s.deleteKey(key)
 	} else {
-		s.data[key] = e
+		s.setEntry(key, e)
 	}
 	return v, true, nil
 }
@@ -414,11 +609,11 @@ func (s *Store) LPop(key string) (string, bool, error) {
 // RPop removes and returns the last element of the list at key. ok is
 // false if key doesn't exist or the list is empty (Redis returns nil in
 // both cases). If the list becomes empty, the key itself is removed. It
-// fails with errWrongType if key holds a string or hash.
+// fails with errWrongType if key holds a string, hash, or zset.
 func (s *Store) RPop(key string) (string, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	e, ok := s.data[key]
+	e, ok := s.lookup(key, true)
 	if !ok {
 		return "", false, nil
 	}
@@ -426,16 +621,16 @@ func (s *Store) RPop(key string) (string, bool, error) {
 		return "", false, errWrongType
 	}
 	if len(e.list) == 0 {
-		delete(s.data, key)
+		s.deleteKey(key)
 		return "", false, nil
 	}
 	last := len(e.list) - 1
 	v := e.list[last]
 	e.list = e.list[:last]
 	if len(e.list) == 0 {
-		delete(s.data, key)
+		s.deleteKey(key)
 	} else {
-		s.data[key] = e
+		s.setEntry(key, e)
 	}
 	return v, true, nil
 }
@@ -445,11 +640,11 @@ func (s *Store) RPop(key string) (string, bool, error) {
 // count from the end of the list (-1 is the last element), and an
 // out-of-range or empty result yields an empty (non-nil) slice rather than
 // an error. A missing key behaves like an empty list. It fails with
-// errWrongType if key holds a string or hash.
+// errWrongType if key holds a string, hash, or zset.
 func (s *Store) LRange(key string, start, stop int64) ([]string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	e, ok := s.data[key]
+	e, ok := s.lookup(key, false)
 	if !ok {
 		return []string{}, nil
 	}
@@ -483,11 +678,11 @@ func (s *Store) LRange(key string, start, stop int64) ([]string, error) {
 }
 
 // LLen returns the length of the list at key, or 0 if key doesn't exist.
-// It fails with errWrongType if key holds a string or hash.
+// It fails with errWrongType if key holds a string, hash, or zset.
 func (s *Store) LLen(key string) (int, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	e, ok := s.data[key]
+	e, ok := s.lookup(key, false)
 	if !ok {
 		return 0, nil
 	}
@@ -516,7 +711,7 @@ func (s *Store) ZAdd(key string, pairs ...ZAddPair) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	e, ok := s.data[key]
+	e, ok := s.lookup(key, true)
 	if ok && e.kind != kindZSet {
 		return 0, errWrongType
 	}
@@ -539,7 +734,7 @@ func (s *Store) ZAdd(key string, pairs ...ZAddPair) (int, error) {
 			added++
 		}
 	}
-	s.data[key] = e
+	s.setEntry(key, e)
 	return added, nil
 }
 
@@ -548,7 +743,7 @@ func (s *Store) ZAdd(key string, pairs ...ZAddPair) (int, error) {
 func (s *Store) ZScore(key, member string) (float64, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	e, ok := s.data[key]
+	e, ok := s.lookup(key, false)
 	if !ok {
 		return 0, false, nil
 	}
@@ -565,7 +760,7 @@ func (s *Store) ZScore(key, member string) (float64, bool, error) {
 func (s *Store) ZRank(key, member string) (int, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	e, ok := s.data[key]
+	e, ok := s.lookup(key, false)
 	if !ok {
 		return 0, false, nil
 	}
@@ -588,7 +783,7 @@ func (s *Store) ZRank(key, member string) (int, bool, error) {
 func (s *Store) ZRange(key string, start, stop int64) ([]ZMember, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	e, ok := s.data[key]
+	e, ok := s.lookup(key, false)
 	if !ok {
 		return []ZMember{}, nil
 	}
@@ -610,7 +805,7 @@ func (s *Store) ZRange(key string, start, stop int64) ([]ZMember, error) {
 func (s *Store) ZRem(key string, members ...string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	e, ok := s.data[key]
+	e, ok := s.lookup(key, true)
 	if !ok {
 		return 0, nil
 	}
@@ -629,9 +824,9 @@ func (s *Store) ZRem(key string, members ...string) (int, error) {
 		count++
 	}
 	if len(e.zset.scores) == 0 {
-		delete(s.data, key)
+		s.deleteKey(key)
 	} else {
-		s.data[key] = e
+		s.setEntry(key, e)
 	}
 	return count, nil
 }
@@ -644,7 +839,7 @@ func (s *Store) ZIncrBy(key string, delta float64, member string) (float64, erro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	e, ok := s.data[key]
+	e, ok := s.lookup(key, true)
 	if ok && e.kind != kindZSet {
 		return 0, errWrongType
 	}
@@ -659,6 +854,6 @@ func (s *Store) ZIncrBy(key string, delta float64, member string) (float64, erro
 	}
 	e.zset.sl.Insert(newScore, member)
 	e.zset.scores[member] = newScore
-	s.data[key] = e
+	s.setEntry(key, e)
 	return newScore, nil
 }

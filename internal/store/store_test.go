@@ -4,6 +4,7 @@ import (
 	"math"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestSetGet(t *testing.T) {
@@ -654,5 +655,164 @@ func TestWrongTypeOnZSets(t *testing.T) {
 		if _, err := s.ZIncrBy(key, 1, "m"); err == nil {
 			t.Errorf("ZIncrBy(%s) err = nil, want WRONGTYPE", key)
 		}
+	}
+}
+
+// --- Expiry ---
+
+func TestExpireAndTTLSeconds(t *testing.T) {
+	s := New()
+	s.Set("k", "v")
+
+	if ttl := s.TTLSeconds("k"); ttl != -1 {
+		t.Errorf("TTLSeconds(k) before Expire = %d, want -1 (no TTL)", ttl)
+	}
+
+	if ok := s.Expire("k", 10*time.Second); !ok {
+		t.Fatal("Expire(k, 10s) = false, want true")
+	}
+	ttl := s.TTLSeconds("k")
+	if ttl <= 0 || ttl > 10 {
+		t.Errorf("TTLSeconds(k) after Expire(10s) = %d, want in (0, 10]", ttl)
+	}
+
+	if ok := s.Expire("missing", 10*time.Second); ok {
+		t.Error("Expire(missing key) = true, want false")
+	}
+	if ttl := s.TTLSeconds("missing"); ttl != -2 {
+		t.Errorf("TTLSeconds(missing) = %d, want -2", ttl)
+	}
+}
+
+func TestExpireNonPositiveDeletesImmediately(t *testing.T) {
+	s := New()
+	s.Set("k", "v")
+
+	if ok := s.Expire("k", 0); !ok {
+		t.Fatal("Expire(k, 0) = false, want true")
+	}
+	if _, ok, _ := s.Get("k"); ok {
+		t.Error("k still present after Expire(k, 0)")
+	}
+	if s.Exists("k") != 0 {
+		t.Error("Exists(k) after Expire(k, 0) = nonzero, want 0")
+	}
+}
+
+func TestPersist(t *testing.T) {
+	s := New()
+	s.Set("k", "v")
+	s.Expire("k", 10*time.Second)
+
+	if ok := s.Persist("k"); !ok {
+		t.Fatal("Persist(k) = false, want true")
+	}
+	if ttl := s.TTLSeconds("k"); ttl != -1 {
+		t.Errorf("TTLSeconds(k) after Persist = %d, want -1", ttl)
+	}
+
+	// Persisting again (no TTL to remove) reports false.
+	if ok := s.Persist("k"); ok {
+		t.Error("Persist(k) again = true, want false")
+	}
+	if ok := s.Persist("missing"); ok {
+		t.Error("Persist(missing) = true, want false")
+	}
+}
+
+func TestSetExAndPlainSetClearsTTL(t *testing.T) {
+	s := New()
+
+	s.SetEx("k", "v", 10*time.Second)
+	ttl := s.TTLSeconds("k")
+	if ttl <= 0 || ttl > 10 {
+		t.Fatalf("TTLSeconds(k) after SetEx = %d, want in (0, 10]", ttl)
+	}
+
+	// A plain Set (no TTL) clears any prior TTL, matching Redis's default
+	// SET behavior.
+	s.Set("k", "v2")
+	if ttl := s.TTLSeconds("k"); ttl != -1 {
+		t.Errorf("TTLSeconds(k) after plain Set = %d, want -1 (TTL cleared)", ttl)
+	}
+}
+
+func TestLazyExpiryHidesExpiredKey(t *testing.T) {
+	s := New()
+	s.SetEx("k", "v", 1*time.Millisecond)
+	time.Sleep(5 * time.Millisecond)
+
+	if _, ok, err := s.Get("k"); ok || err != nil {
+		t.Errorf("Get(expired key) = _, %v, %v, want false, nil", ok, err)
+	}
+	if s.Exists("k") != 0 {
+		t.Error("Exists(expired key) = nonzero, want 0")
+	}
+	if ttl := s.TTLSeconds("k"); ttl != -2 {
+		t.Errorf("TTLSeconds(expired key) = %d, want -2 (treated as missing)", ttl)
+	}
+
+	// A write-path accessor must also treat it as absent, and may create
+	// a fresh, TTL-less entry in its place.
+	n, err := s.Incr("k")
+	if err != nil || n != 1 {
+		t.Errorf("Incr(expired key) = %d, %v, want 1, nil (treated as missing, starts at 0)", n, err)
+	}
+	if ttl := s.TTLSeconds("k"); ttl != -1 {
+		t.Errorf("TTLSeconds(k) after Incr recreated it = %d, want -1", ttl)
+	}
+}
+
+func TestTTLPreservedAcrossMutation(t *testing.T) {
+	s := New()
+	s.Set("counter", "1")
+	s.Expire("counter", 10*time.Second)
+
+	if _, err := s.Incr("counter"); err != nil {
+		t.Fatalf("Incr: %v", err)
+	}
+	ttl := s.TTLSeconds("counter")
+	if ttl <= 0 || ttl > 10 {
+		t.Errorf("TTLSeconds(counter) after Incr = %d, want in (0, 10] (TTL preserved)", ttl)
+	}
+
+	s.Set("str", "hello")
+	s.Expire("str", 10*time.Second)
+	if _, err := s.Append("str", " world"); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	ttl = s.TTLSeconds("str")
+	if ttl <= 0 || ttl > 10 {
+		t.Errorf("TTLSeconds(str) after Append = %d, want in (0, 10] (TTL preserved)", ttl)
+	}
+}
+
+func TestActiveExpirySweepsExpiredKeys(t *testing.T) {
+	s := New()
+	s.SetEx("k1", "v", 1*time.Millisecond)
+	s.SetEx("k2", "v", 1*time.Millisecond)
+	s.Set("persistent", "v") // no TTL — must survive the sweep
+
+	stop := s.StartActiveExpiry(5 * time.Millisecond)
+	defer stop()
+
+	time.Sleep(5 * time.Millisecond)  // let the keys actually expire
+	time.Sleep(30 * time.Millisecond) // give the sweep goroutine time to run
+
+	s.mu.RLock()
+	_, k1Present := s.data["k1"]
+	_, k2Present := s.data["k2"]
+	_, persistentPresent := s.data["persistent"]
+	_, k1InTTLSet := s.keysWithTTL["k1"]
+	s.mu.RUnlock()
+
+	if k1Present || k2Present {
+		t.Errorf("expired keys still in s.data after active sweep: k1=%v k2=%v", k1Present, k2Present)
+	}
+	if !persistentPresent {
+		t.Error("persistent (no-TTL) key was removed by active sweep")
+	}
+	if k1InTTLSet {
+		t.Error("k1 still tracked in keysWithTTL after active sweep")
 	}
 }

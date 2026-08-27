@@ -570,3 +570,106 @@ func TestZIncrBy(t *testing.T) {
 		t.Errorf("zincrby(bad increment) = %+v, want an error reply", got)
 	}
 }
+
+// --- Expiry ---
+
+func TestSetWithExAndPx(t *testing.T) {
+	s := store.New()
+
+	got := set(s, []string{"k", "v", "EX", "10"})
+	if !reflect.DeepEqual(got, resp.SimpleStringValue("OK")) {
+		t.Errorf("set(k, v, EX, 10) = %+v, want OK", got)
+	}
+	ttl := ttlCmd(s, []string{"k"}).Num
+	if ttl <= 0 || ttl > 10 {
+		t.Errorf("ttl after SET EX 10 = %d, want in (0, 10]", ttl)
+	}
+
+	got = set(s, []string{"k2", "v", "PX", "5000"})
+	if !reflect.DeepEqual(got, resp.SimpleStringValue("OK")) {
+		t.Errorf("set(k2, v, PX, 5000) = %+v, want OK", got)
+	}
+	ttl = ttlCmd(s, []string{"k2"}).Num
+	if ttl <= 0 || ttl > 5 {
+		t.Errorf("ttl after SET PX 5000 = %d, want in (0, 5]", ttl)
+	}
+
+	if got := set(s, []string{"k", "v", "EX", "not-a-number"}); got.Type != resp.Error {
+		t.Errorf("set(EX, bad number) = %+v, want an error reply", got)
+	}
+	if got := set(s, []string{"k", "v", "EX", "0"}); got.Type != resp.Error {
+		t.Errorf("set(EX, 0) = %+v, want an error reply (non-positive expire)", got)
+	}
+	if got := set(s, []string{"k", "v", "BOGUS", "1"}); got.Type != resp.Error {
+		t.Errorf("set(unknown option) = %+v, want an error reply", got)
+	}
+	if got := set(s, []string{"k", "v", "EX"}); got.Type != resp.Error {
+		t.Errorf("set(EX with no value) = %+v, want an error reply", got)
+	}
+}
+
+func TestExpireTTLPersist(t *testing.T) {
+	s := store.New()
+	set(s, []string{"k", "v"})
+
+	want := resp.IntegerValue(-1)
+	if got := ttlCmd(s, []string{"k"}); !reflect.DeepEqual(got, want) {
+		t.Errorf("ttl(k) before expire = %+v, want %+v", got, want)
+	}
+
+	want = resp.IntegerValue(1)
+	if got := expireCmd(s, []string{"k", "10"}); !reflect.DeepEqual(got, want) {
+		t.Errorf("expire(k, 10) = %+v, want %+v", got, want)
+	}
+	ttl := ttlCmd(s, []string{"k"}).Num
+	if ttl <= 0 || ttl > 10 {
+		t.Errorf("ttl(k) after expire = %d, want in (0, 10]", ttl)
+	}
+
+	want = resp.IntegerValue(1)
+	if got := persistCmd(s, []string{"k"}); !reflect.DeepEqual(got, want) {
+		t.Errorf("persist(k) = %+v, want %+v", got, want)
+	}
+	want = resp.IntegerValue(-1)
+	if got := ttlCmd(s, []string{"k"}); !reflect.DeepEqual(got, want) {
+		t.Errorf("ttl(k) after persist = %+v, want %+v", got, want)
+	}
+
+	want = resp.IntegerValue(0)
+	if got := persistCmd(s, []string{"k"}); !reflect.DeepEqual(got, want) {
+		t.Errorf("persist(k) again = %+v, want %+v", got, want)
+	}
+
+	want = resp.IntegerValue(0)
+	if got := expireCmd(s, []string{"missing", "10"}); !reflect.DeepEqual(got, want) {
+		t.Errorf("expire(missing) = %+v, want %+v", got, want)
+	}
+	want = resp.IntegerValue(-2)
+	if got := ttlCmd(s, []string{"missing"}); !reflect.DeepEqual(got, want) {
+		t.Errorf("ttl(missing) = %+v, want %+v", got, want)
+	}
+
+	if got := expireCmd(s, []string{"k", "not-a-number"}); got.Type != resp.Error {
+		t.Errorf("expire(bad seconds) = %+v, want an error reply", got)
+	}
+	if got := ttlCmd(s, nil); got.Type != resp.Error {
+		t.Errorf("ttl(wrong arity) = %+v, want an error reply", got)
+	}
+	if got := persistCmd(s, nil); got.Type != resp.Error {
+		t.Errorf("persist(wrong arity) = %+v, want an error reply", got)
+	}
+}
+
+func TestExpireDeletesKeyImmediatelyOnNonPositiveSeconds(t *testing.T) {
+	s := store.New()
+	set(s, []string{"k", "v"})
+
+	want := resp.IntegerValue(1)
+	if got := expireCmd(s, []string{"k", "0"}); !reflect.DeepEqual(got, want) {
+		t.Errorf("expire(k, 0) = %+v, want %+v", got, want)
+	}
+	wantGet := resp.NullBulkString()
+	if got := get(s, []string{"k"}); !reflect.DeepEqual(got, wantGet) {
+		t.Errorf("get(k) after expire(k, 0) = %+v, want %+v", got, wantGet)
+	}
+}

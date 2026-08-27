@@ -21,11 +21,12 @@ headed so future work stays consistent. Planned/expected components:
 **Status:** Phase 1 (project scaffold + RESP protocol + TCP server with PING/ECHO),
 Phase 2 (in-memory key-value store + string commands: SET, GET, DEL, EXISTS, INCR, DECR,
 APPEND, STRLEN), Phase 3 (typed store + hash/list commands: HSET, HGET, HDEL, HGETALL,
-HEXISTS, HLEN, LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN, with WRONGTYPE errors), and
-Phase 4 (custom skip list + sorted-set commands: ZADD, ZSCORE, ZRANK, ZRANGE, ZREM,
-ZINCRBY) are done. See Architecture below for what exists now. Don't assume later phases
-(event loop, TTL, persistence, Docker) exist until their own commits land — check the
-working tree and update Architecture/Commands as each phase is completed.
+HEXISTS, HLEN, LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN, with WRONGTYPE errors), Phase 4
+(custom skip list + sorted-set commands: ZADD, ZSCORE, ZRANK, ZRANGE, ZREM, ZINCRBY),
+and Phase 5 (TTL/expiry: EXPIRE, TTL, PERSIST, SET ... EX/PX, lazy + active expiry) are
+done. See Architecture below for what exists now. Don't assume later phases (event loop,
+persistence, Docker) exist until their own commits land — check the working tree and
+update Architecture/Commands as each phase is completed.
 
 ## Working conventions
 
@@ -50,8 +51,9 @@ working tree and update Architecture/Commands as each phase is completed.
   `redis-cli -p 6379 get k` / `redis-cli -p 6379 incr counter` / `redis-cli -p 6379 hset h
   f v` / `redis-cli -p 6379 hgetall h` / `redis-cli -p 6379 rpush l a b c` /
   `redis-cli -p 6379 lrange l 0 -1` / `redis-cli -p 6379 zadd z 1 a 2 b` /
-  `redis-cli -p 6379 zrange z 0 -1`, or raw RESP over `nc 127.0.0.1 6379` if `redis-cli`
-  isn't installed.
+  `redis-cli -p 6379 zrange z 0 -1` / `redis-cli -p 6379 set k v EX 10` /
+  `redis-cli -p 6379 ttl k`, or raw RESP over `nc 127.0.0.1 6379` if `redis-cli` isn't
+  installed.
 - **Build:** `go build ./...`
 - **Test everything:** `go test ./...` (add `-v` for per-test output)
 - **Test one package:** `go test ./internal/resp/...`
@@ -73,25 +75,40 @@ Module: `github.com/Ishan819/Redis-clone`.
   Redis commands — it's pure protocol.
 - `internal/store/` — the in-memory key-value store, independent of RESP and commands.
   `Store` wraps a `map[string]entry` guarded by a `sync.RWMutex` (one mutex for the whole
-  map — fine at this scale). Each key holds a typed `entry` (`kind` — string, hash, or
-  list — plus whichever of `str`/`hash`/`list` applies), so every accessor checks the
-  key's kind and fails with `errWrongType` ("WRONGTYPE Operation against a key holding
-  the wrong kind of value") if it doesn't match, matching Redis's cross-type behavior. A
-  hash or list that's emptied by a delete/pop removes the key entirely, matching Redis
-  (an empty hash/list doesn't exist). String methods (`Set`, `Get`, `Del`, `Exists`,
-  `IncrBy`/`Incr`/`Decr`, `Append`, `Strlen`) take and return plain Go values; `IncrBy`
-  does its read-modify-write under a single lock so concurrent INCRs are atomic, and
-  returns a plain Go `error` (message text already Redis-error-shaped) on a non-integer
-  value, int64 overflow, or wrong type. Hash methods (`HSet`, `HGet`, `HDel`, `HGetAll`,
-  `HExists`, `HLen`) operate on a `map[string]string` per key; `HGetAll` returns a copy,
-  not a live view. List methods (`LPush`, `RPush`, `LPop`, `RPop`, `LRange`, `LLen`)
-  operate on a `[]string` per key; `LRange` implements Redis's negative-index semantics
-  (-1 is the last element) and clamps out-of-range indices to an empty result rather than
-  erroring. Sorted-set methods (`ZAdd`, `ZScore`, `ZRank`, `ZRange`, `ZRem`, `ZIncrBy`)
-  operate on a `*zsetValue` per key — a `skiplist.SkipList` (ordering) paired with a
-  `map[string]float64` (O(1) member -> score lookup for `ZScore`), the same two-structure
-  design Redis's own sorted sets use; `ZAdd`/`ZIncrBy` keep both in sync by deleting a
-  member's old skip list entry before reinserting it at its new score.
+  map — fine at this scale). Each key holds a typed `entry` (`kind` — string, hash, list,
+  or zset — plus whichever of `str`/`hash`/`list`/`zset` applies, plus an `expireAt
+  time.Time`), so every accessor checks the key's kind and fails with `errWrongType`
+  ("WRONGTYPE Operation against a key holding the wrong kind of value") if it doesn't
+  match, matching Redis's cross-type behavior. A hash, list, or zset that's emptied by a
+  delete/pop/rem removes the key entirely, matching Redis (an empty collection doesn't
+  exist). String methods (`Set`, `Get`, `Del`, `Exists`, `IncrBy`/`Incr`/`Decr`, `Append`,
+  `Strlen`) take and return plain Go values; `IncrBy`/`Append` preserve any existing TTL
+  (they modify a value in place, unlike `Set`) and `IncrBy` does its read-modify-write
+  under a single lock so concurrent INCRs are atomic; all return a plain Go `error`
+  (message text already Redis-error-shaped) on a non-integer value, int64 overflow, or
+  wrong type. Hash methods (`HSet`, `HGet`, `HDel`, `HGetAll`, `HExists`, `HLen`) operate
+  on a `map[string]string` per key; `HGetAll` returns a copy, not a live view. List
+  methods (`LPush`, `RPush`, `LPop`, `RPop`, `LRange`, `LLen`) operate on a `[]string` per
+  key; `LRange` implements Redis's negative-index semantics (-1 is the last element) and
+  clamps out-of-range indices to an empty result rather than erroring. Sorted-set methods
+  (`ZAdd`, `ZScore`, `ZRank`, `ZRange`, `ZRem`, `ZIncrBy`) operate on a `*zsetValue` per
+  key — a `skiplist.SkipList` (ordering) paired with a `map[string]float64` (O(1) member
+  -> score lookup for `ZScore`), the same two-structure design Redis's own sorted sets
+  use; `ZAdd`/`ZIncrBy` keep both in sync by deleting a member's old skip list entry
+  before reinserting it at its new score.
+  **Expiry** (`Expire`, `TTLSeconds`, `Persist`, `SetEx`, `StartActiveExpiry`) has two
+  halves, matching Redis: lazy — every accessor routes key lookups through the internal
+  `lookup` helper, which treats a key past its `expireAt` as absent (deleting it from the
+  map when the caller holds the write lock, since a read-lock caller can't safely mutate
+  the map); and active — `StartActiveExpiry(interval)` runs a background goroutine
+  (started by `internal/server` at 100ms, matching Redis's own default active-expire
+  cadence) that each tick samples up to 20 keys from `keysWithTTL` (a side map of just the
+  keys with a TTL set, so the sweep doesn't have to scan the whole keyspace) and deletes
+  any that have expired, reclaiming memory even for keys nothing ever reads again.
+  `setEntry`/`deleteKey` are the only places allowed to write `s.data` directly — every
+  other method goes through them so `keysWithTTL` never drifts out of sync. `Set`
+  (`SetEx` with no TTL) clears any existing TTL, matching Redis's default `SET` behavior;
+  `SetEx(key, value, ttl)` is the `SET ... EX/PX` path.
 - `internal/skiplist/` — a skip list built from scratch (no libraries), independent of the
   store and RESP. `SkipList` stores `Element{Score, Member}` pairs ordered by `Score`
   ascending with ties broken by `Member` ascending, matching Redis sorted-set ordering.
@@ -110,19 +127,22 @@ Module: `github.com/Ishan819/Redis-clone`.
   nothing outside this package needs to change. Handlers take the shared store plus
   already-decoded string args (not RESP `Value`s) and return the `resp.Value` reply
   directly, translating store errors (including WRONGTYPE) into RESP error replies.
-  Implemented so far: PING, ECHO; strings — SET, GET, DEL, EXISTS, INCR, DECR, APPEND,
-  STRLEN; hashes — HSET, HGET, HDEL, HGETALL, HEXISTS, HLEN; lists — LPUSH, RPUSH, LPOP,
-  RPOP, LRANGE, LLEN; sorted sets — ZADD, ZSCORE, ZRANK, ZRANGE, ZREM, ZINCRBY (scores are
-  formatted with `strconv.FormatFloat(score, 'f', -1, 64)`, the shortest round-tripping
-  decimal — not byte-for-byte identical to Redis's own dtoa for exotic values, but matches
-  for all typical scores).
+  Implemented so far: PING, ECHO; strings — SET (with optional `EX seconds`/`PX
+  milliseconds`), GET, DEL, EXISTS, INCR, DECR, APPEND, STRLEN; hashes — HSET, HGET,
+  HDEL, HGETALL, HEXISTS, HLEN; lists — LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN; sorted
+  sets — ZADD, ZSCORE, ZRANK, ZRANGE, ZREM, ZINCRBY (scores are formatted with
+  `strconv.FormatFloat(score, 'f', -1, 64)`, the shortest round-tripping decimal — not
+  byte-for-byte identical to Redis's own dtoa for exotic values, but matches for all
+  typical scores); expiry — EXPIRE, TTL, PERSIST.
 - `internal/server/` — the TCP front end, currently one goroutine per connection (`Server.handleConn`).
-  `Server` owns one `*store.Store`, shared by all connections. Per connection: wrap the
-  `net.Conn` in a `resp.Reader`, loop reading a `Value`, convert it to `[]string` args via
-  `toArgs` (which enforces that a command is a RESP array of bulk strings), look up the
-  `command.Handler` and invoke it with the server's store, and write the reply's `Marshal()`
-  bytes back on the same connection. Unknown commands and malformed requests get a RESP
-  error reply rather than closing the connection.
+  `Server` owns one `*store.Store`, shared by all connections. `ListenAndServe` starts the
+  store's active-expiry background sweep (100ms interval) alongside the accept loop and
+  stops it on shutdown. Per connection: wrap the `net.Conn` in a `resp.Reader`, loop
+  reading a `Value`, convert it to `[]string` args via `toArgs` (which enforces that a
+  command is a RESP array of bulk strings), look up the `command.Handler` and invoke it
+  with the server's store, and write the reply's `Marshal()` bytes back on the same
+  connection. Unknown commands and malformed requests get a RESP error reply rather than
+  closing the connection.
 
 **Data flow:** `net.Conn` → `resp.Reader.Read()` → `[]string` args (`server.toArgs`) →
 `command.Lookup` + `Handler(store, args)` → `resp.Value` reply → `Value.Marshal()` →

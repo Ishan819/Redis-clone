@@ -6,6 +6,7 @@ package command
 import (
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Ishan819/Redis-clone/internal/resp"
 	"github.com/Ishan819/Redis-clone/internal/store"
@@ -49,6 +50,10 @@ var registry = map[string]Handler{
 	"ZRANGE":  zrange,
 	"ZREM":    zrem,
 	"ZINCRBY": zincrby,
+
+	"EXPIRE":  expireCmd,
+	"TTL":     ttlCmd,
+	"PERSIST": persistCmd,
 }
 
 // Lookup returns the handler registered for name, matched case-insensitively
@@ -81,14 +86,42 @@ func echo(_ *store.Store, args []string) resp.Value {
 
 // --- Strings ---
 
-// set implements SET key value: it unconditionally stores value under key
-// (overwriting any existing value, of any type) and replies +OK. (Optional
-// SET flags like EX/NX are not implemented yet.)
+// set implements SET key value [EX seconds | PX milliseconds]: it
+// unconditionally stores value under key (overwriting any existing value,
+// of any type, and any TTL it had) and replies +OK. With EX or PX, the key
+// additionally gets a TTL, exactly as if EXPIRE had been called right
+// after. (Other SET flags like NX/XX/KEEPTTL are not implemented yet.)
 func set(s *store.Store, args []string) resp.Value {
-	if len(args) != 2 {
+	if len(args) < 2 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'set' command")
 	}
-	s.Set(args[0], args[1])
+	key, value := args[0], args[1]
+
+	var ttl time.Duration
+	opts := args[2:]
+	for i := 0; i < len(opts); i++ {
+		switch strings.ToUpper(opts[i]) {
+		case "EX", "PX":
+			unit := strings.ToUpper(opts[i])
+			if i+1 >= len(opts) {
+				return resp.ErrorValue("ERR syntax error")
+			}
+			n, err := strconv.ParseInt(opts[i+1], 10, 64)
+			if err != nil || n <= 0 {
+				return resp.ErrorValue("ERR invalid expire time in 'set' command")
+			}
+			if unit == "EX" {
+				ttl = time.Duration(n) * time.Second
+			} else {
+				ttl = time.Duration(n) * time.Millisecond
+			}
+			i++
+		default:
+			return resp.ErrorValue("ERR syntax error")
+		}
+	}
+
+	s.SetEx(key, value, ttl)
 	return resp.SimpleStringValue("OK")
 }
 
@@ -489,4 +522,45 @@ func zincrby(s *store.Store, args []string) resp.Value {
 		return resp.ErrorValue(err.Error())
 	}
 	return resp.BulkStringValue(formatScore(newScore))
+}
+
+// --- Expiry ---
+
+// expireCmd implements EXPIRE key seconds: it sets key's remaining time to
+// live and returns 1, or returns 0 if key doesn't exist. Applies
+// regardless of key's type.
+func expireCmd(s *store.Store, args []string) resp.Value {
+	if len(args) != 2 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'expire' command")
+	}
+	secs, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil {
+		return resp.ErrorValue("ERR value is not an integer or out of range")
+	}
+	if s.Expire(args[0], time.Duration(secs)*time.Second) {
+		return resp.IntegerValue(1)
+	}
+	return resp.IntegerValue(0)
+}
+
+// ttlCmd implements TTL key: it returns key's remaining time to live in
+// seconds, -1 if key exists but has no TTL, or -2 if key doesn't exist.
+func ttlCmd(s *store.Store, args []string) resp.Value {
+	if len(args) != 1 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'ttl' command")
+	}
+	return resp.IntegerValue(s.TTLSeconds(args[0]))
+}
+
+// persistCmd implements PERSIST key: it removes key's TTL (if it has one)
+// and returns 1, or returns 0 if key doesn't exist or already had no TTL.
+// Applies regardless of key's type.
+func persistCmd(s *store.Store, args []string) resp.Value {
+	if len(args) != 1 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'persist' command")
+	}
+	if s.Persist(args[0]) {
+		return resp.IntegerValue(1)
+	}
+	return resp.IntegerValue(0)
 }

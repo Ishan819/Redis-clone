@@ -13,11 +13,17 @@ import (
 	"io"
 	"log"
 	"net"
+	"time"
 
 	"github.com/Ishan819/Redis-clone/internal/command"
 	"github.com/Ishan819/Redis-clone/internal/resp"
 	"github.com/Ishan819/Redis-clone/internal/store"
 )
+
+// activeExpiryInterval is how often the server sweeps a sample of
+// keys-with-TTL for expired entries, matching the cadence of Redis's own
+// default active expire cycle (10 times per second).
+const activeExpiryInterval = 100 * time.Millisecond
 
 // Server is a minimal RESP-speaking TCP server. All connections share a
 // single in-memory Store.
@@ -40,6 +46,10 @@ func (s *Server) ListenAndServe() error {
 		return fmt.Errorf("server: listen on %s: %w", s.Addr, err)
 	}
 	defer ln.Close()
+
+	stopActiveExpiry := s.store.StartActiveExpiry(activeExpiryInterval)
+	defer stopActiveExpiry()
+
 	log.Printf("redis-clone listening on %s", s.Addr)
 
 	for {
