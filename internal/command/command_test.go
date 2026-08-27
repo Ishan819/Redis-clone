@@ -1,9 +1,11 @@
 package command
 
 import (
+	"os"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Ishan819/Redis-clone/internal/resp"
 	"github.com/Ishan819/Redis-clone/internal/store"
@@ -671,5 +673,71 @@ func TestExpireDeletesKeyImmediatelyOnNonPositiveSeconds(t *testing.T) {
 	wantGet := resp.NullBulkString()
 	if got := get(s, []string{"k"}); !reflect.DeepEqual(got, wantGet) {
 		t.Errorf("get(k) after expire(k, 0) = %+v, want %+v", got, wantGet)
+	}
+}
+
+// --- Persistence ---
+
+// withTempWorkDir chdirs into a fresh temp directory for the duration of
+// the test, so SAVE/BGSAVE (which write to the fixed relative path
+// store.DefaultRDBPath) can't touch this repo's working directory.
+func withTempWorkDir(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("Chdir(%s): %v", dir, err)
+	}
+	t.Cleanup(func() { os.Chdir(oldWD) })
+}
+
+func TestSave(t *testing.T) {
+	withTempWorkDir(t)
+	s := store.New()
+	set(s, []string{"k", "v"})
+
+	got := save(s, nil)
+	want := resp.SimpleStringValue("OK")
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("save() = %+v, want %+v", got, want)
+	}
+	if _, err := os.Stat(store.DefaultRDBPath); err != nil {
+		t.Errorf("SAVE didn't create %s: %v", store.DefaultRDBPath, err)
+	}
+
+	if got := save(s, []string{"unexpected-arg"}); got.Type != resp.Error {
+		t.Errorf("save(wrong arity) = %+v, want an error reply", got)
+	}
+}
+
+func TestBgsave(t *testing.T) {
+	withTempWorkDir(t)
+	s := store.New()
+	set(s, []string{"k", "v"})
+
+	got := bgsave(s, nil)
+	want := resp.SimpleStringValue("Background saving started")
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("bgsave() = %+v, want %+v", got, want)
+	}
+
+	// BGSAVE's write happens in a background goroutine; poll briefly for
+	// the file to appear rather than asserting on a fixed sleep.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(store.DefaultRDBPath); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("BGSAVE didn't create %s within 2s", store.DefaultRDBPath)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if got := bgsave(s, []string{"unexpected-arg"}); got.Type != resp.Error {
+		t.Errorf("bgsave(wrong arity) = %+v, want an error reply", got)
 	}
 }

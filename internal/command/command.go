@@ -4,6 +4,7 @@
 package command
 
 import (
+	"log"
 	"strconv"
 	"strings"
 	"time"
@@ -54,6 +55,9 @@ var registry = map[string]Handler{
 	"EXPIRE":  expireCmd,
 	"TTL":     ttlCmd,
 	"PERSIST": persistCmd,
+
+	"SAVE":   save,
+	"BGSAVE": bgsave,
 }
 
 // Lookup returns the handler registered for name, matched case-insensitively
@@ -563,4 +567,39 @@ func persistCmd(s *store.Store, args []string) resp.Value {
 		return resp.IntegerValue(1)
 	}
 	return resp.IntegerValue(0)
+}
+
+// --- Persistence ---
+
+// save implements SAVE: it synchronously writes a full snapshot of the
+// dataset to store.DefaultRDBPath and replies +OK, blocking the client
+// until the write completes, or replies with an error if it failed.
+func save(s *store.Store, args []string) resp.Value {
+	if len(args) != 0 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'save' command")
+	}
+	if err := s.SaveToFile(store.DefaultRDBPath); err != nil {
+		return resp.Errorf("ERR %v", err)
+	}
+	return resp.SimpleStringValue("OK")
+}
+
+// bgsave implements BGSAVE: it starts the snapshot write in a background
+// goroutine and replies immediately, matching Redis's response text. This
+// server has no fork(), so "background" here means concurrent with
+// serving other clients rather than a forked child process as real Redis
+// uses — the store's own locking makes that safe. A failure is logged
+// server-side rather than returned to the client, since the client has
+// already been told the save started, not that it finished (matching
+// Redis, where BGSAVE failures likewise don't reach the original caller).
+func bgsave(s *store.Store, args []string) resp.Value {
+	if len(args) != 0 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'bgsave' command")
+	}
+	go func() {
+		if err := s.SaveToFile(store.DefaultRDBPath); err != nil {
+			log.Printf("redis-clone: BGSAVE failed: %v", err)
+		}
+	}()
+	return resp.SimpleStringValue("Background saving started")
 }

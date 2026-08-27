@@ -23,10 +23,11 @@ Phase 2 (in-memory key-value store + string commands: SET, GET, DEL, EXISTS, INC
 APPEND, STRLEN), Phase 3 (typed store + hash/list commands: HSET, HGET, HDEL, HGETALL,
 HEXISTS, HLEN, LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN, with WRONGTYPE errors), Phase 4
 (custom skip list + sorted-set commands: ZADD, ZSCORE, ZRANK, ZRANGE, ZREM, ZINCRBY),
-and Phase 5 (TTL/expiry: EXPIRE, TTL, PERSIST, SET ... EX/PX, lazy + active expiry) are
-done. See Architecture below for what exists now. Don't assume later phases (event loop,
-persistence, Docker) exist until their own commits land — check the working tree and
-update Architecture/Commands as each phase is completed.
+Phase 5 (TTL/expiry: EXPIRE, TTL, PERSIST, SET ... EX/PX, lazy + active expiry), and
+Phase 6 (RDB-style persistence: SAVE, BGSAVE, periodic background snapshotting, reload
+on startup) are done. See Architecture below for what exists now. Don't assume later
+phases (event loop, Docker) exist until their own commits land — check the working tree
+and update Architecture/Commands as each phase is completed.
 
 ## Working conventions
 
@@ -52,8 +53,9 @@ update Architecture/Commands as each phase is completed.
   f v` / `redis-cli -p 6379 hgetall h` / `redis-cli -p 6379 rpush l a b c` /
   `redis-cli -p 6379 lrange l 0 -1` / `redis-cli -p 6379 zadd z 1 a 2 b` /
   `redis-cli -p 6379 zrange z 0 -1` / `redis-cli -p 6379 set k v EX 10` /
-  `redis-cli -p 6379 ttl k`, or raw RESP over `nc 127.0.0.1 6379` if `redis-cli` isn't
-  installed.
+  `redis-cli -p 6379 ttl k` / `redis-cli -p 6379 save` (writes `dump.rdb` in the working
+  directory; restart the server from the same directory to confirm data reloads), or raw
+  RESP over `nc 127.0.0.1 6379` if `redis-cli` isn't installed.
 - **Build:** `go build ./...`
 - **Test everything:** `go test ./...` (add `-v` for per-test output)
 - **Test one package:** `go test ./internal/resp/...`
@@ -109,6 +111,20 @@ Module: `github.com/Ishan819/Redis-clone`.
   other method goes through them so `keysWithTTL` never drifts out of sync. `Set`
   (`SetEx` with no TTL) clears any existing TTL, matching Redis's default `SET` behavior;
   `SetEx(key, value, ttl)` is the `SET ... EX/PX` path.
+  **Persistence** (`internal/store/persistence.go`) is RDB-*style*, not RDB-*compatible*:
+  `Snapshot()` walks the live (non-expired) keys under a read lock and builds a
+  gob-serializable `snapshot` (a flat `[]snapshotKey`, every field exported so
+  `encoding/gob`'s reflection can see it; a zset is flattened to its member/score pairs
+  rather than serializing the skiplist, since the skiplist is cheap to rebuild via
+  repeated `Insert` on load). `SaveToFile(path)` gob-encodes that snapshot to a temp file
+  in the same directory and renames it into place, so a crash or concurrent read mid-write
+  can never observe a truncated file. `LoadFromFile(path)` decodes and calls `Restore`,
+  which replaces the store's entire contents and rebuilds each zset's skiplist from its
+  member/score list; a missing file returns an error wrapping `os.ErrNotExist` so callers
+  can tell "no snapshot yet" apart from a real failure. `DefaultRDBPath` ("dump.rdb",
+  matching Redis's own default dbfilename) is the single shared path constant used by the
+  command layer (SAVE/BGSAVE) and the server (startup load, periodic snapshot) so they
+  never drift onto different files.
 - `internal/skiplist/` — a skip list built from scratch (no libraries), independent of the
   store and RESP. `SkipList` stores `Element{Score, Member}` pairs ordered by `Score`
   ascending with ties broken by `Member` ascending, matching Redis sorted-set ordering.
@@ -133,16 +149,23 @@ Module: `github.com/Ishan819/Redis-clone`.
   sets — ZADD, ZSCORE, ZRANK, ZRANGE, ZREM, ZINCRBY (scores are formatted with
   `strconv.FormatFloat(score, 'f', -1, 64)`, the shortest round-tripping decimal — not
   byte-for-byte identical to Redis's own dtoa for exotic values, but matches for all
-  typical scores); expiry — EXPIRE, TTL, PERSIST.
+  typical scores); expiry — EXPIRE, TTL, PERSIST; persistence — SAVE (synchronous,
+  blocks the client until `store.SaveToFile` returns) and BGSAVE (starts the same save in
+  a goroutine and replies immediately — this project has no `fork()`, so "background"
+  means concurrent-with-serving rather than a forked child process as real Redis uses;
+  the store's own locking makes that safe).
 - `internal/server/` — the TCP front end, currently one goroutine per connection (`Server.handleConn`).
-  `Server` owns one `*store.Store`, shared by all connections. `ListenAndServe` starts the
-  store's active-expiry background sweep (100ms interval) alongside the accept loop and
-  stops it on shutdown. Per connection: wrap the `net.Conn` in a `resp.Reader`, loop
-  reading a `Value`, convert it to `[]string` args via `toArgs` (which enforces that a
-  command is a RESP array of bulk strings), look up the `command.Handler` and invoke it
-  with the server's store, and write the reply's `Marshal()` bytes back on the same
-  connection. Unknown commands and malformed requests get a RESP error reply rather than
-  closing the connection.
+  `Server` owns one `*store.Store`, shared by all connections. `ListenAndServe` loads
+  `store.DefaultRDBPath` into the store if it exists (logging either way — a missing file
+  is a normal first run, not an error), starts the active-expiry background sweep (100ms
+  interval), and starts an unconditional periodic snapshot (`startPeriodicSnapshot`,
+  60s interval — simpler than Redis's change-triggered save points, at the cost of
+  occasionally saving an unchanged dataset), stopping both on shutdown. Per connection:
+  wrap the `net.Conn` in a `resp.Reader`, loop reading a `Value`, convert it to
+  `[]string` args via `toArgs` (which enforces that a command is a RESP array of bulk
+  strings), look up the `command.Handler` and invoke it with the server's store, and
+  write the reply's `Marshal()` bytes back on the same connection. Unknown commands and
+  malformed requests get a RESP error reply rather than closing the connection.
 
 **Data flow:** `net.Conn` → `resp.Reader.Read()` → `[]string` args (`server.toArgs`) →
 `command.Lookup` + `Handler(store, args)` → `resp.Value` reply → `Value.Marshal()` →
