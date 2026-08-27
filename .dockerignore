@@ -1,0 +1,7 @@
+.git/
+.claude/
+bin/
+*.rdb
+CLAUDE.md
+docker-compose.yml
+Dockerfile

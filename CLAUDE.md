@@ -23,11 +23,12 @@ Phase 2 (in-memory key-value store + string commands: SET, GET, DEL, EXISTS, INC
 APPEND, STRLEN), Phase 3 (typed store + hash/list commands: HSET, HGET, HDEL, HGETALL,
 HEXISTS, HLEN, LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN, with WRONGTYPE errors), Phase 4
 (custom skip list + sorted-set commands: ZADD, ZSCORE, ZRANK, ZRANGE, ZREM, ZINCRBY),
-Phase 5 (TTL/expiry: EXPIRE, TTL, PERSIST, SET ... EX/PX, lazy + active expiry), and
-Phase 6 (RDB-style persistence: SAVE, BGSAVE, periodic background snapshotting, reload
-on startup) are done. See Architecture below for what exists now. Don't assume later
-phases (event loop, Docker) exist until their own commits land — check the working tree
-and update Architecture/Commands as each phase is completed.
+Phase 5 (TTL/expiry: EXPIRE, TTL, PERSIST, SET ... EX/PX, lazy + active expiry), Phase 6
+(RDB-style persistence: SAVE, BGSAVE, periodic background snapshotting, reload on
+startup), and Phase 7 (Docker packaging: multi-stage Dockerfile, docker-compose.yml with
+a persistent RDB volume) are done. See Architecture below for what exists now. Don't
+assume later phases (event loop) exist until their own commits land — check the working
+tree and update Architecture/Commands as each phase is completed.
 
 ## Working conventions
 
@@ -62,6 +63,16 @@ and update Architecture/Commands as each phase is completed.
 - **Test one test:** `go test ./internal/resp/... -run TestReaderRead -v`
 - **Vet:** `go vet ./...`
 - **Format:** `gofmt -l .` to list unformatted files, `gofmt -w .` to fix
+- **Run in Docker (one-off container):**
+  `docker build -t redis-clone .` to build the image, then
+  `docker run --rm -p 6379:6379 -v redis-clone-data:/data redis-clone` to run it with a
+  named volume for `dump.rdb` (drop `-v ...` for a throwaway, non-persistent container).
+  Test the same way as a local server: `redis-cli -p 6379 set k v` / `redis-cli -p 6379
+  get k`.
+- **Run in Docker (docker compose, preferred for local dev):** `docker compose up -d
+  --build` to build and start; `docker compose logs -f` to follow logs; `docker compose
+  down` to stop and remove the container (the named volume `rdb-data`, and the `dump.rdb`
+  snapshot inside it, survive `down`/`up` — only `docker compose down -v` deletes it too).
 
 ## Architecture
 
@@ -166,6 +177,19 @@ Module: `github.com/Ishan819/Redis-clone`.
   strings), look up the `command.Handler` and invoke it with the server's store, and
   write the reply's `Marshal()` bytes back on the same connection. Unknown commands and
   malformed requests get a RESP error reply rather than closing the connection.
+- `Dockerfile` — multi-stage build. Stage 1 (`golang:1.27-alpine`, matching the Go version
+  in `go.mod`) compiles a static binary (`CGO_ENABLED=0`) so the runtime stage needs no
+  libc/shared libraries. Stage 2 (`alpine:3.20`, chosen over a distroless/scratch base
+  specifically so it's easy to `docker exec` in and inspect `dump.rdb` or debug a volume
+  issue) copies in just that binary, sets `WORKDIR /data` (so the server's relative
+  `store.DefaultRDBPath` reads/writes there), and `EXPOSE`s 6379.
+- `docker-compose.yml` — builds the image from the local `Dockerfile`, maps host port 6379
+  to the container, and mounts a named volume (`rdb-data`) at `/data` so the RDB snapshot
+  outlives `docker compose down`/`up` and container recreation, not just a plain restart —
+  verified by populating data, `docker compose down`, `docker compose up`, and confirming
+  the data was still there.
+- `.dockerignore` — keeps the build context (and thus the image) free of `.git`, local
+  build artifacts, and any stray `*.rdb` file from local testing.
 
 **Data flow:** `net.Conn` → `resp.Reader.Read()` → `[]string` args (`server.toArgs`) →
 `command.Lookup` + `Handler(store, args)` → `resp.Value` reply → `Value.Marshal()` →

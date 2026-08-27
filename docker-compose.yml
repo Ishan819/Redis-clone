@@ -1,0 +1,14 @@
+services:
+  redis-clone:
+    build: .
+    ports:
+      - "6379:6379"
+    volumes:
+      # Persists the RDB snapshot (internal/store/persistence.go writes
+      # dump.rdb into the container's /data, the image's WORKDIR) in a
+      # named volume, so data survives `docker compose down`/`up` and
+      # container recreation, not just a plain restart.
+      - rdb-data:/data
+
+volumes:
+  rdb-data:
