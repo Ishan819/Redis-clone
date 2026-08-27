@@ -477,3 +477,182 @@ func TestWrongTypeOnLists(t *testing.T) {
 		}
 	}
 }
+
+// --- Sorted sets ---
+
+func TestZAddZScore(t *testing.T) {
+	s := New()
+
+	n, err := s.ZAdd("z", ZAddPair{Score: 1, Member: "a"})
+	if err != nil || n != 1 {
+		t.Fatalf("ZAdd(new member) = %d, %v, want 1, nil", n, err)
+	}
+
+	score, ok, err := s.ZScore("z", "a")
+	if err != nil || !ok || score != 1 {
+		t.Errorf("ZScore(z, a) = %v, %v, %v, want 1, true, nil", score, ok, err)
+	}
+
+	// Re-adding the same member with a different score updates it and
+	// reports 0 newly added.
+	n, err = s.ZAdd("z", ZAddPair{Score: 5, Member: "a"})
+	if err != nil || n != 0 {
+		t.Fatalf("ZAdd(update score) = %d, %v, want 0, nil", n, err)
+	}
+	score, _, _ = s.ZScore("z", "a")
+	if score != 5 {
+		t.Errorf("ZScore(z, a) after update = %v, want 5", score)
+	}
+
+	// Multiple pairs in one call.
+	n, err = s.ZAdd("z", ZAddPair{Score: 2, Member: "b"}, ZAddPair{Score: 3, Member: "c"})
+	if err != nil || n != 2 {
+		t.Fatalf("ZAdd(two new members) = %d, %v, want 2, nil", n, err)
+	}
+}
+
+func TestZScoreMissing(t *testing.T) {
+	s := New()
+	if _, ok, err := s.ZScore("missing", "m"); ok || err != nil {
+		t.Errorf("ZScore(missing key) = _, %v, %v, want false, nil", ok, err)
+	}
+	s.ZAdd("z", ZAddPair{Score: 1, Member: "a"})
+	if _, ok, err := s.ZScore("z", "nope"); ok || err != nil {
+		t.Errorf("ZScore(missing member) = _, %v, %v, want false, nil", ok, err)
+	}
+}
+
+func TestZRank(t *testing.T) {
+	s := New()
+	s.ZAdd("z",
+		ZAddPair{Score: 30, Member: "c"},
+		ZAddPair{Score: 10, Member: "a"},
+		ZAddPair{Score: 20, Member: "b"},
+	)
+
+	tests := []struct {
+		member   string
+		wantRank int
+	}{
+		{"a", 0},
+		{"b", 1},
+		{"c", 2},
+	}
+	for _, tt := range tests {
+		rank, ok, err := s.ZRank("z", tt.member)
+		if err != nil || !ok || rank != tt.wantRank {
+			t.Errorf("ZRank(z, %s) = %d, %v, %v, want %d, true, nil", tt.member, rank, ok, err, tt.wantRank)
+		}
+	}
+
+	if _, ok, err := s.ZRank("z", "nope"); ok || err != nil {
+		t.Errorf("ZRank(missing member) = _, %v, %v, want false, nil", ok, err)
+	}
+	if _, ok, err := s.ZRank("missing", "a"); ok || err != nil {
+		t.Errorf("ZRank(missing key) = _, %v, %v, want false, nil", ok, err)
+	}
+}
+
+func TestZRange(t *testing.T) {
+	s := New()
+	s.ZAdd("z",
+		ZAddPair{Score: 1, Member: "a"},
+		ZAddPair{Score: 2, Member: "b"},
+		ZAddPair{Score: 3, Member: "c"},
+	)
+
+	got, err := s.ZRange("z", 0, -1)
+	want := []ZMember{{"a", 1}, {"b", 2}, {"c", 3}}
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Errorf("ZRange(z, 0, -1) = %v, %v, want %v, nil", got, err, want)
+	}
+
+	got, err = s.ZRange("z", -1, -1)
+	want = []ZMember{{"c", 3}}
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Errorf("ZRange(z, -1, -1) = %v, %v, want %v, nil", got, err, want)
+	}
+}
+
+func TestZRangeMissingKey(t *testing.T) {
+	s := New()
+	got, err := s.ZRange("missing", 0, -1)
+	if err != nil || !reflect.DeepEqual(got, []ZMember{}) {
+		t.Errorf("ZRange(missing) = %v, %v, want [], nil", got, err)
+	}
+}
+
+func TestZRem(t *testing.T) {
+	s := New()
+	s.ZAdd("z", ZAddPair{Score: 1, Member: "a"}, ZAddPair{Score: 2, Member: "b"})
+
+	n, err := s.ZRem("z", "a", "nope")
+	if err != nil || n != 1 {
+		t.Fatalf("ZRem(z, a, nope) = %d, %v, want 1, nil", n, err)
+	}
+	if _, ok, _ := s.ZScore("z", "a"); ok {
+		t.Error("a still present after ZRem")
+	}
+
+	// Removing the last member removes the key entirely.
+	if _, err := s.ZRem("z", "b"); err != nil {
+		t.Fatalf("ZRem(z, b): %v", err)
+	}
+	if s.Exists("z") != 0 {
+		t.Error("z key still exists after all members removed")
+	}
+}
+
+func TestZIncrBy(t *testing.T) {
+	s := New()
+
+	score, err := s.ZIncrBy("z", 5, "a")
+	if err != nil || score != 5 {
+		t.Fatalf("ZIncrBy(missing member, 5) = %v, %v, want 5, nil", score, err)
+	}
+
+	score, err = s.ZIncrBy("z", 2.5, "a")
+	if err != nil || score != 7.5 {
+		t.Fatalf("ZIncrBy(a, 2.5) = %v, %v, want 7.5, nil", score, err)
+	}
+
+	score, err = s.ZIncrBy("z", -10, "a")
+	if err != nil || score != -2.5 {
+		t.Fatalf("ZIncrBy(a, -10) = %v, %v, want -2.5, nil", score, err)
+	}
+
+	// Rank/order must stay consistent after ZIncrBy changes a score.
+	s.ZAdd("z", ZAddPair{Score: 0, Member: "b"})
+	rank, ok, err := s.ZRank("z", "a")
+	if err != nil || !ok || rank != 0 {
+		t.Errorf("ZRank(z, a) after incr below b = %d, %v, %v, want 0, true, nil", rank, ok, err)
+	}
+}
+
+func TestWrongTypeOnZSets(t *testing.T) {
+	s := New()
+	s.Set("str", "v")
+	s.HSet("hash", "f", "v")
+	s.RPush("list", "a")
+
+	for _, key := range []string{"str", "hash", "list"} {
+		if _, err := s.ZAdd(key, ZAddPair{Score: 1, Member: "m"}); err == nil {
+			t.Errorf("ZAdd(%s) err = nil, want WRONGTYPE", key)
+		}
+		if _, _, err := s.ZScore(key, "m"); err == nil {
+			t.Errorf("ZScore(%s) err = nil, want WRONGTYPE", key)
+		}
+		if _, _, err := s.ZRank(key, "m"); err == nil {
+			t.Errorf("ZRank(%s) err = nil, want WRONGTYPE", key)
+		}
+		if _, err := s.ZRange(key, 0, -1); err == nil {
+			t.Errorf("ZRange(%s) err = nil, want WRONGTYPE", key)
+		}
+		if _, err := s.ZRem(key, "m"); err == nil {
+			t.Errorf("ZRem(%s) err = nil, want WRONGTYPE", key)
+		}
+		if _, err := s.ZIncrBy(key, 1, "m"); err == nil {
+			t.Errorf("ZIncrBy(%s) err = nil, want WRONGTYPE", key)
+		}
+	}
+}

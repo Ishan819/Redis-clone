@@ -13,6 +13,8 @@ import (
 	"math"
 	"strconv"
 	"sync"
+
+	"github.com/Ishan819/Redis-clone/internal/skiplist"
 )
 
 // errNotInteger is returned by IncrBy when the key's current value can't be
@@ -32,6 +34,7 @@ const (
 	kindString kind = iota
 	kindHash
 	kindList
+	kindZSet
 )
 
 // entry is the store's internal representation of one key's value. Only
@@ -41,6 +44,27 @@ type entry struct {
 	str  string
 	hash map[string]string
 	list []string
+	zset *zsetValue
+}
+
+// zsetValue is a sorted set: a skiplist.SkipList giving ordered access
+// (Rank, Range) plus a member -> score map giving O(1) ZSCORE lookups —
+// the same two-structure design Redis's own sorted sets use, since a skip
+// list alone can't answer "what's this member's score" without an O(n)
+// scan.
+type zsetValue struct {
+	sl     *skiplist.SkipList
+	scores map[string]float64
+}
+
+func newZSet() *zsetValue {
+	return &zsetValue{sl: skiplist.New(), scores: make(map[string]float64)}
+}
+
+// ZMember is one (member, score) pair returned by ZRange.
+type ZMember struct {
+	Member string
+	Score  float64
 }
 
 // Store is a thread-safe in-memory key-value store supporting strings,
@@ -471,4 +495,170 @@ func (s *Store) LLen(key string) (int, error) {
 		return 0, errWrongType
 	}
 	return len(e.list), nil
+}
+
+// --- Sorted sets ---
+
+// ZAddPair is one (score, member) pair passed to ZAdd.
+type ZAddPair struct {
+	Score  float64
+	Member string
+}
+
+// ZAdd sets each pair's member to its score in the sorted set at key,
+// creating the set if needed, and returns how many members were newly
+// added (not merely re-scored) — matching Redis's ZADD return value. If a
+// member already exists, its skip list entry is removed and reinserted at
+// the new score (a no-op if the score is unchanged), keeping the skip
+// list's ordering and the member->score map in sync. It fails with
+// errWrongType if key holds a non-zset type.
+func (s *Store) ZAdd(key string, pairs ...ZAddPair) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.data[key]
+	if ok && e.kind != kindZSet {
+		return 0, errWrongType
+	}
+	if !ok {
+		e = entry{kind: kindZSet, zset: newZSet()}
+	}
+
+	added := 0
+	for _, pr := range pairs {
+		if oldScore, exists := e.zset.scores[pr.Member]; exists {
+			if oldScore == pr.Score {
+				continue
+			}
+			e.zset.sl.Delete(oldScore, pr.Member)
+			e.zset.sl.Insert(pr.Score, pr.Member)
+			e.zset.scores[pr.Member] = pr.Score
+		} else {
+			e.zset.sl.Insert(pr.Score, pr.Member)
+			e.zset.scores[pr.Member] = pr.Score
+			added++
+		}
+	}
+	s.data[key] = e
+	return added, nil
+}
+
+// ZScore returns member's score in the sorted set at key, and whether it
+// was present. It fails with errWrongType if key holds a non-zset type.
+func (s *Store) ZScore(key, member string) (float64, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e, ok := s.data[key]
+	if !ok {
+		return 0, false, nil
+	}
+	if e.kind != kindZSet {
+		return 0, false, errWrongType
+	}
+	score, ok := e.zset.scores[member]
+	return score, ok, nil
+}
+
+// ZRank returns member's 0-based rank in the sorted set at key, ordered by
+// score ascending (ties broken by member name), and whether it was
+// present. It fails with errWrongType if key holds a non-zset type.
+func (s *Store) ZRank(key, member string) (int, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e, ok := s.data[key]
+	if !ok {
+		return 0, false, nil
+	}
+	if e.kind != kindZSet {
+		return 0, false, errWrongType
+	}
+	score, ok := e.zset.scores[member]
+	if !ok {
+		return 0, false, nil
+	}
+	rank, ok := e.zset.sl.Rank(score, member)
+	return rank, ok, nil
+}
+
+// ZRange returns the members of the sorted set at key between ranks start
+// and stop, inclusive, ordered by score ascending (ties broken by member
+// name), supporting negative indices (-1 is the last element) as Redis
+// does. A missing key behaves like an empty set. It fails with
+// errWrongType if key holds a non-zset type.
+func (s *Store) ZRange(key string, start, stop int64) ([]ZMember, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e, ok := s.data[key]
+	if !ok {
+		return []ZMember{}, nil
+	}
+	if e.kind != kindZSet {
+		return nil, errWrongType
+	}
+	elems := e.zset.sl.Range(int(start), int(stop))
+	result := make([]ZMember, len(elems))
+	for i, el := range elems {
+		result[i] = ZMember{Member: el.Member, Score: el.Score}
+	}
+	return result, nil
+}
+
+// ZRem removes each of members from the sorted set at key and returns how
+// many were actually removed. If the set becomes empty, the key itself is
+// removed, matching Redis. It fails with errWrongType if key holds a
+// non-zset type.
+func (s *Store) ZRem(key string, members ...string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.data[key]
+	if !ok {
+		return 0, nil
+	}
+	if e.kind != kindZSet {
+		return 0, errWrongType
+	}
+
+	count := 0
+	for _, m := range members {
+		score, exists := e.zset.scores[m]
+		if !exists {
+			continue
+		}
+		e.zset.sl.Delete(score, m)
+		delete(e.zset.scores, m)
+		count++
+	}
+	if len(e.zset.scores) == 0 {
+		delete(s.data, key)
+	} else {
+		s.data[key] = e
+	}
+	return count, nil
+}
+
+// ZIncrBy adds delta to member's score in the sorted set at key (creating
+// the set, and the member with a starting score of 0, if either doesn't
+// exist yet) and returns the new score, matching Redis's ZINCRBY. It fails
+// with errWrongType if key holds a non-zset type.
+func (s *Store) ZIncrBy(key string, delta float64, member string) (float64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.data[key]
+	if ok && e.kind != kindZSet {
+		return 0, errWrongType
+	}
+	if !ok {
+		e = entry{kind: kindZSet, zset: newZSet()}
+	}
+
+	oldScore, exists := e.zset.scores[member]
+	newScore := oldScore + delta
+	if exists {
+		e.zset.sl.Delete(oldScore, member)
+	}
+	e.zset.sl.Insert(newScore, member)
+	e.zset.scores[member] = newScore
+	s.data[key] = e
+	return newScore, nil
 }

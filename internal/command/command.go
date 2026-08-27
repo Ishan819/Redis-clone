@@ -42,6 +42,13 @@ var registry = map[string]Handler{
 	"RPOP":   rpop,
 	"LRANGE": lrange,
 	"LLEN":   llen,
+
+	"ZADD":    zadd,
+	"ZSCORE":  zscore,
+	"ZRANK":   zrank,
+	"ZRANGE":  zrange,
+	"ZREM":    zrem,
+	"ZINCRBY": zincrby,
 }
 
 // Lookup returns the handler registered for name, matched case-insensitively
@@ -362,4 +369,124 @@ func llen(s *store.Store, args []string) resp.Value {
 		return resp.ErrorValue(err.Error())
 	}
 	return resp.IntegerValue(int64(n))
+}
+
+// --- Sorted sets ---
+
+// formatScore renders a sorted-set score the way Redis does: the shortest
+// decimal string that round-trips to the same float64, with no forced
+// trailing ".0" for whole numbers (Redis prints "5", not "5.0").
+func formatScore(score float64) string {
+	return strconv.FormatFloat(score, 'f', -1, 64)
+}
+
+// zadd implements ZADD key score member [score member ...]: it sets each
+// member to its score in the sorted set at key (creating the set if
+// needed) and returns how many members were newly added.
+func zadd(s *store.Store, args []string) resp.Value {
+	if len(args) < 3 || (len(args)-1)%2 != 0 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'zadd' command")
+	}
+	pairs := make([]store.ZAddPair, 0, (len(args)-1)/2)
+	for i := 1; i+1 < len(args); i += 2 {
+		score, err := strconv.ParseFloat(args[i], 64)
+		if err != nil {
+			return resp.ErrorValue("ERR value is not a valid float")
+		}
+		pairs = append(pairs, store.ZAddPair{Score: score, Member: args[i+1]})
+	}
+	n, err := s.ZAdd(args[0], pairs...)
+	if err != nil {
+		return resp.ErrorValue(err.Error())
+	}
+	return resp.IntegerValue(int64(n))
+}
+
+// zscore implements ZSCORE key member: it returns member's score as a
+// bulk string, or a null bulk string if the key or member doesn't exist.
+func zscore(s *store.Store, args []string) resp.Value {
+	if len(args) != 2 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'zscore' command")
+	}
+	score, ok, err := s.ZScore(args[0], args[1])
+	if err != nil {
+		return resp.ErrorValue(err.Error())
+	}
+	if !ok {
+		return resp.NullBulkString()
+	}
+	return resp.BulkStringValue(formatScore(score))
+}
+
+// zrank implements ZRANK key member: it returns member's 0-based rank (by
+// score ascending, ties broken by member name) as an integer, or a null
+// bulk string if the key or member doesn't exist.
+func zrank(s *store.Store, args []string) resp.Value {
+	if len(args) != 2 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'zrank' command")
+	}
+	rank, ok, err := s.ZRank(args[0], args[1])
+	if err != nil {
+		return resp.ErrorValue(err.Error())
+	}
+	if !ok {
+		return resp.NullBulkString()
+	}
+	return resp.IntegerValue(int64(rank))
+}
+
+// zrange implements ZRANGE key start stop: it returns the members of the
+// sorted set at key between start and stop, inclusive, ordered by score
+// ascending, supporting negative indices (-1 is the last element) as
+// Redis does.
+func zrange(s *store.Store, args []string) resp.Value {
+	if len(args) != 3 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'zrange' command")
+	}
+	start, err1 := strconv.ParseInt(args[1], 10, 64)
+	stop, err2 := strconv.ParseInt(args[2], 10, 64)
+	if err1 != nil || err2 != nil {
+		return resp.ErrorValue("ERR value is not an integer or out of range")
+	}
+	members, err := s.ZRange(args[0], start, stop)
+	if err != nil {
+		return resp.ErrorValue(err.Error())
+	}
+	vals := make([]resp.Value, len(members))
+	for i, m := range members {
+		vals[i] = resp.BulkStringValue(m.Member)
+	}
+	return resp.ArrayValue(vals...)
+}
+
+// zrem implements ZREM key member [member ...]: it removes each given
+// member from the sorted set at key and returns how many were actually
+// removed.
+func zrem(s *store.Store, args []string) resp.Value {
+	if len(args) < 2 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'zrem' command")
+	}
+	n, err := s.ZRem(args[0], args[1:]...)
+	if err != nil {
+		return resp.ErrorValue(err.Error())
+	}
+	return resp.IntegerValue(int64(n))
+}
+
+// zincrby implements ZINCRBY key increment member: it adds increment to
+// member's score (creating the set and/or member with a starting score of
+// 0 if needed) and returns the new score as a bulk string.
+func zincrby(s *store.Store, args []string) resp.Value {
+	if len(args) != 3 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'zincrby' command")
+	}
+	delta, err := strconv.ParseFloat(args[1], 64)
+	if err != nil {
+		return resp.ErrorValue("ERR value is not a valid float")
+	}
+	newScore, err := s.ZIncrBy(args[0], delta, args[2])
+	if err != nil {
+		return resp.ErrorValue(err.Error())
+	}
+	return resp.BulkStringValue(formatScore(newScore))
 }

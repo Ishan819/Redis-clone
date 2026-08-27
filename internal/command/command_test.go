@@ -425,6 +425,12 @@ func TestWrongTypeErrors(t *testing.T) {
 		{"rpop on string", func() resp.Value { return rpop(s, []string{"str"}) }},
 		{"lrange on hash", func() resp.Value { return lrange(s, []string{"hash", "0", "-1"}) }},
 		{"llen on string", func() resp.Value { return llen(s, []string{"str"}) }},
+		{"zadd on string", func() resp.Value { return zadd(s, []string{"str", "1", "m"}) }},
+		{"zscore on hash", func() resp.Value { return zscore(s, []string{"hash", "m"}) }},
+		{"zrank on list", func() resp.Value { return zrank(s, []string{"list", "m"}) }},
+		{"zrange on string", func() resp.Value { return zrange(s, []string{"str", "0", "-1"}) }},
+		{"zrem on hash", func() resp.Value { return zrem(s, []string{"hash", "m"}) }},
+		{"zincrby on list", func() resp.Value { return zincrby(s, []string{"list", "1", "m"}) }},
 	}
 
 	for _, tt := range wrongTypeCases {
@@ -434,5 +440,133 @@ func TestWrongTypeErrors(t *testing.T) {
 				t.Errorf("%s = %+v, want a WRONGTYPE error reply", tt.name, got)
 			}
 		})
+	}
+}
+
+// --- Sorted sets ---
+
+func TestZAddZScore(t *testing.T) {
+	s := store.New()
+
+	got := zadd(s, []string{"z", "1", "a"})
+	want := resp.IntegerValue(1)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("zadd(z, 1, a) = %+v, want %+v", got, want)
+	}
+
+	wantScore := resp.BulkStringValue("1")
+	if got := zscore(s, []string{"z", "a"}); !reflect.DeepEqual(got, wantScore) {
+		t.Errorf("zscore(z, a) = %+v, want %+v", got, wantScore)
+	}
+
+	// Updating an existing member's score reports 0 newly added.
+	got = zadd(s, []string{"z", "2.5", "a"})
+	want = resp.IntegerValue(0)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("zadd(update score) = %+v, want %+v", got, want)
+	}
+	wantScore = resp.BulkStringValue("2.5")
+	if got := zscore(s, []string{"z", "a"}); !reflect.DeepEqual(got, wantScore) {
+		t.Errorf("zscore(z, a) after update = %+v, want %+v", got, wantScore)
+	}
+
+	if got := zadd(s, []string{"z", "not-a-float", "b"}); got.Type != resp.Error {
+		t.Errorf("zadd(bad score) = %+v, want an error reply", got)
+	}
+	if got := zadd(s, []string{"z", "1"}); got.Type != resp.Error {
+		t.Errorf("zadd(wrong arity) = %+v, want an error reply", got)
+	}
+}
+
+func TestZScoreMissing(t *testing.T) {
+	want := resp.NullBulkString()
+	if got := zscore(store.New(), []string{"missing", "m"}); !reflect.DeepEqual(got, want) {
+		t.Errorf("zscore(missing key) = %+v, want %+v", got, want)
+	}
+	s := store.New()
+	zadd(s, []string{"z", "1", "a"})
+	if got := zscore(s, []string{"z", "nope"}); !reflect.DeepEqual(got, want) {
+		t.Errorf("zscore(missing member) = %+v, want %+v", got, want)
+	}
+}
+
+func TestZRank(t *testing.T) {
+	s := store.New()
+	zadd(s, []string{"z", "30", "c", "10", "a", "20", "b"})
+
+	tests := []struct {
+		member   string
+		wantRank int64
+	}{
+		{"a", 0},
+		{"b", 1},
+		{"c", 2},
+	}
+	for _, tt := range tests {
+		want := resp.IntegerValue(tt.wantRank)
+		if got := zrank(s, []string{"z", tt.member}); !reflect.DeepEqual(got, want) {
+			t.Errorf("zrank(z, %s) = %+v, want %+v", tt.member, got, want)
+		}
+	}
+
+	want := resp.NullBulkString()
+	if got := zrank(s, []string{"z", "nope"}); !reflect.DeepEqual(got, want) {
+		t.Errorf("zrank(missing member) = %+v, want %+v", got, want)
+	}
+}
+
+func TestZRange(t *testing.T) {
+	s := store.New()
+	zadd(s, []string{"z", "1", "a", "2", "b", "3", "c"})
+
+	got := zrange(s, []string{"z", "0", "-1"})
+	want := resp.ArrayValue(resp.BulkStringValue("a"), resp.BulkStringValue("b"), resp.BulkStringValue("c"))
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("zrange(z, 0, -1) = %+v, want %+v", got, want)
+	}
+
+	got = zrange(s, []string{"z", "-1", "-1"})
+	want = resp.ArrayValue(resp.BulkStringValue("c"))
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("zrange(z, -1, -1) = %+v, want %+v", got, want)
+	}
+
+	if got := zrange(s, []string{"z", "bad", "-1"}); got.Type != resp.Error {
+		t.Errorf("zrange(bad index) = %+v, want an error reply", got)
+	}
+}
+
+func TestZRem(t *testing.T) {
+	s := store.New()
+	zadd(s, []string{"z", "1", "a", "2", "b"})
+
+	got := zrem(s, []string{"z", "a", "nope"})
+	want := resp.IntegerValue(1)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("zrem(z, a, nope) = %+v, want %+v", got, want)
+	}
+
+	if got := zrem(s, []string{"z"}); got.Type != resp.Error {
+		t.Errorf("zrem(wrong arity) = %+v, want an error reply", got)
+	}
+}
+
+func TestZIncrBy(t *testing.T) {
+	s := store.New()
+
+	got := zincrby(s, []string{"z", "5", "a"})
+	want := resp.BulkStringValue("5")
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("zincrby(missing member, 5) = %+v, want %+v", got, want)
+	}
+
+	got = zincrby(s, []string{"z", "2.5", "a"})
+	want = resp.BulkStringValue("7.5")
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("zincrby(a, 2.5) = %+v, want %+v", got, want)
+	}
+
+	if got := zincrby(s, []string{"z", "not-a-float", "a"}); got.Type != resp.Error {
+		t.Errorf("zincrby(bad increment) = %+v, want an error reply", got)
 	}
 }
