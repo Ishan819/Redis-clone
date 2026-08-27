@@ -4,6 +4,7 @@
 package command
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/Ishan819/Redis-clone/internal/resp"
@@ -27,6 +28,20 @@ var registry = map[string]Handler{
 	"DECR":   decr,
 	"APPEND": appendCmd,
 	"STRLEN": strlen,
+
+	"HSET":    hset,
+	"HGET":    hget,
+	"HDEL":    hdel,
+	"HGETALL": hgetall,
+	"HEXISTS": hexists,
+	"HLEN":    hlen,
+
+	"LPUSH":  lpush,
+	"RPUSH":  rpush,
+	"LPOP":   lpop,
+	"RPOP":   rpop,
+	"LRANGE": lrange,
+	"LLEN":   llen,
 }
 
 // Lookup returns the handler registered for name, matched case-insensitively
@@ -57,8 +72,11 @@ func echo(_ *store.Store, args []string) resp.Value {
 	return resp.BulkStringValue(args[0])
 }
 
+// --- Strings ---
+
 // set implements SET key value: it unconditionally stores value under key
-// and replies +OK. (Optional SET flags like EX/NX are not implemented yet.)
+// (overwriting any existing value, of any type) and replies +OK. (Optional
+// SET flags like EX/NX are not implemented yet.)
 func set(s *store.Store, args []string) resp.Value {
 	if len(args) != 2 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'set' command")
@@ -73,15 +91,18 @@ func get(s *store.Store, args []string) resp.Value {
 	if len(args) != 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'get' command")
 	}
-	v, ok := s.Get(args[0])
+	v, ok, err := s.Get(args[0])
+	if err != nil {
+		return resp.ErrorValue(err.Error())
+	}
 	if !ok {
 		return resp.NullBulkString()
 	}
 	return resp.BulkStringValue(v)
 }
 
-// del implements DEL key [key ...]: it removes each given key and returns
-// the number of keys actually removed.
+// del implements DEL key [key ...]: it removes each given key (of any
+// type) and returns the number of keys actually removed.
 func del(s *store.Store, args []string) resp.Value {
 	if len(args) < 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'del' command")
@@ -90,7 +111,7 @@ func del(s *store.Store, args []string) resp.Value {
 }
 
 // exists implements EXISTS key [key ...]: it returns how many of the given
-// keys are present (counting repeats).
+// keys are present (counting repeats), regardless of type.
 func exists(s *store.Store, args []string) resp.Value {
 	if len(args) < 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'exists' command")
@@ -100,7 +121,7 @@ func exists(s *store.Store, args []string) resp.Value {
 
 // incr implements INCR key: it increments the integer value at key by 1
 // (treating a missing key as 0) and returns the new value. It errors if the
-// existing value isn't an integer.
+// existing value isn't an integer or key holds a non-string type.
 func incr(s *store.Store, args []string) resp.Value {
 	if len(args) != 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'incr' command")
@@ -131,7 +152,11 @@ func appendCmd(s *store.Store, args []string) resp.Value {
 	if len(args) != 2 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'append' command")
 	}
-	return resp.IntegerValue(int64(s.Append(args[0], args[1])))
+	n, err := s.Append(args[0], args[1])
+	if err != nil {
+		return resp.ErrorValue(err.Error())
+	}
+	return resp.IntegerValue(int64(n))
 }
 
 // strlen implements STRLEN key: it returns the length of the string stored
@@ -140,5 +165,201 @@ func strlen(s *store.Store, args []string) resp.Value {
 	if len(args) != 1 {
 		return resp.ErrorValue("ERR wrong number of arguments for 'strlen' command")
 	}
-	return resp.IntegerValue(int64(s.Strlen(args[0])))
+	n, err := s.Strlen(args[0])
+	if err != nil {
+		return resp.ErrorValue(err.Error())
+	}
+	return resp.IntegerValue(int64(n))
+}
+
+// --- Hashes ---
+
+// hset implements HSET key field value [field value ...]: it sets each
+// field to its value in the hash at key (creating the hash if needed) and
+// returns how many fields were newly created.
+func hset(s *store.Store, args []string) resp.Value {
+	if len(args) < 3 || (len(args)-1)%2 != 0 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'hset' command")
+	}
+	n, err := s.HSet(args[0], args[1:]...)
+	if err != nil {
+		return resp.ErrorValue(err.Error())
+	}
+	return resp.IntegerValue(int64(n))
+}
+
+// hget implements HGET key field: it returns the field's value as a bulk
+// string, or a null bulk string if the key or field doesn't exist.
+func hget(s *store.Store, args []string) resp.Value {
+	if len(args) != 2 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'hget' command")
+	}
+	v, ok, err := s.HGet(args[0], args[1])
+	if err != nil {
+		return resp.ErrorValue(err.Error())
+	}
+	if !ok {
+		return resp.NullBulkString()
+	}
+	return resp.BulkStringValue(v)
+}
+
+// hdel implements HDEL key field [field ...]: it removes each given field
+// from the hash at key and returns how many fields were actually removed.
+func hdel(s *store.Store, args []string) resp.Value {
+	if len(args) < 2 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'hdel' command")
+	}
+	n, err := s.HDel(args[0], args[1:]...)
+	if err != nil {
+		return resp.ErrorValue(err.Error())
+	}
+	return resp.IntegerValue(int64(n))
+}
+
+// hgetall implements HGETALL key: it returns all fields and values in the
+// hash at key as a flat array (field1, value1, field2, value2, ...), or an
+// empty array if key doesn't exist.
+func hgetall(s *store.Store, args []string) resp.Value {
+	if len(args) != 1 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'hgetall' command")
+	}
+	fields, err := s.HGetAll(args[0])
+	if err != nil {
+		return resp.ErrorValue(err.Error())
+	}
+	vals := make([]resp.Value, 0, len(fields)*2)
+	for field, value := range fields {
+		vals = append(vals, resp.BulkStringValue(field), resp.BulkStringValue(value))
+	}
+	return resp.ArrayValue(vals...)
+}
+
+// hexists implements HEXISTS key field: it returns 1 if field is present
+// in the hash at key, else 0.
+func hexists(s *store.Store, args []string) resp.Value {
+	if len(args) != 2 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'hexists' command")
+	}
+	ok, err := s.HExists(args[0], args[1])
+	if err != nil {
+		return resp.ErrorValue(err.Error())
+	}
+	if ok {
+		return resp.IntegerValue(1)
+	}
+	return resp.IntegerValue(0)
+}
+
+// hlen implements HLEN key: it returns the number of fields in the hash at
+// key, or 0 if key doesn't exist.
+func hlen(s *store.Store, args []string) resp.Value {
+	if len(args) != 1 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'hlen' command")
+	}
+	n, err := s.HLen(args[0])
+	if err != nil {
+		return resp.ErrorValue(err.Error())
+	}
+	return resp.IntegerValue(int64(n))
+}
+
+// --- Lists ---
+
+// lpush implements LPUSH key value [value ...]: it pushes each value onto
+// the head of the list at key (creating the list if needed) and returns
+// the list's new length.
+func lpush(s *store.Store, args []string) resp.Value {
+	if len(args) < 2 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'lpush' command")
+	}
+	n, err := s.LPush(args[0], args[1:]...)
+	if err != nil {
+		return resp.ErrorValue(err.Error())
+	}
+	return resp.IntegerValue(int64(n))
+}
+
+// rpush implements RPUSH key value [value ...]: it pushes each value onto
+// the tail of the list at key (creating the list if needed) and returns
+// the list's new length.
+func rpush(s *store.Store, args []string) resp.Value {
+	if len(args) < 2 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'rpush' command")
+	}
+	n, err := s.RPush(args[0], args[1:]...)
+	if err != nil {
+		return resp.ErrorValue(err.Error())
+	}
+	return resp.IntegerValue(int64(n))
+}
+
+// lpop implements LPOP key: it removes and returns the first element of
+// the list at key, or a null bulk string if key doesn't exist or the list
+// is empty.
+func lpop(s *store.Store, args []string) resp.Value {
+	if len(args) != 1 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'lpop' command")
+	}
+	v, ok, err := s.LPop(args[0])
+	if err != nil {
+		return resp.ErrorValue(err.Error())
+	}
+	if !ok {
+		return resp.NullBulkString()
+	}
+	return resp.BulkStringValue(v)
+}
+
+// rpop implements RPOP key: it removes and returns the last element of the
+// list at key, or a null bulk string if key doesn't exist or the list is
+// empty.
+func rpop(s *store.Store, args []string) resp.Value {
+	if len(args) != 1 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'rpop' command")
+	}
+	v, ok, err := s.RPop(args[0])
+	if err != nil {
+		return resp.ErrorValue(err.Error())
+	}
+	if !ok {
+		return resp.NullBulkString()
+	}
+	return resp.BulkStringValue(v)
+}
+
+// lrange implements LRANGE key start stop: it returns the elements of the
+// list at key between start and stop, inclusive, supporting negative
+// indices (-1 is the last element) as Redis does.
+func lrange(s *store.Store, args []string) resp.Value {
+	if len(args) != 3 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'lrange' command")
+	}
+	start, err1 := strconv.ParseInt(args[1], 10, 64)
+	stop, err2 := strconv.ParseInt(args[2], 10, 64)
+	if err1 != nil || err2 != nil {
+		return resp.ErrorValue("ERR value is not an integer or out of range")
+	}
+	elems, err := s.LRange(args[0], start, stop)
+	if err != nil {
+		return resp.ErrorValue(err.Error())
+	}
+	vals := make([]resp.Value, len(elems))
+	for i, v := range elems {
+		vals[i] = resp.BulkStringValue(v)
+	}
+	return resp.ArrayValue(vals...)
+}
+
+// llen implements LLEN key: it returns the length of the list at key, or 0
+// if key doesn't exist.
+func llen(s *store.Store, args []string) resp.Value {
+	if len(args) != 1 {
+		return resp.ErrorValue("ERR wrong number of arguments for 'llen' command")
+	}
+	n, err := s.LLen(args[0])
+	if err != nil {
+		return resp.ErrorValue(err.Error())
+	}
+	return resp.IntegerValue(int64(n))
 }
