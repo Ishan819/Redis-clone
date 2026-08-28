@@ -1,23 +1,23 @@
 // Package server implements the TCP front end of the redis-clone process:
-// it accepts client connections, decodes RESP commands off the wire, and
-// dispatches them to the command package.
-//
-// Phase 1 uses one goroutine per connection, the simplest thing that works.
-// A later phase replaces the accept/read loop here with an epoll-based
-// event loop without changing the command package at all.
+// it owns the listener's lifecycle (accepting a snapshot on startup,
+// running background expiry and periodic snapshotting) and hands the
+// listener off to internal/eventloop for the actual accept/read/dispatch
+// loop. Phase 8 split that loop into its own package specifically so it
+// could have two implementations — an epoll-based event loop on Linux, a
+// goroutine-per-connection fallback everywhere else — selected by build
+// tag without this package needing to know or care which one it's running;
+// see internal/eventloop's package doc for the design.
 package server
 
 import (
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
 	"time"
 
-	"github.com/Ishan819/Redis-clone/internal/command"
-	"github.com/Ishan819/Redis-clone/internal/resp"
+	"github.com/Ishan819/Redis-clone/internal/eventloop"
 	"github.com/Ishan819/Redis-clone/internal/store"
 )
 
@@ -66,13 +66,7 @@ func (s *Server) ListenAndServe() error {
 
 	log.Printf("redis-clone listening on %s", s.Addr)
 
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			return fmt.Errorf("server: accept: %w", err)
-		}
-		go s.handleConn(conn)
-	}
+	return eventloop.Serve(ln, s.store)
 }
 
 // loadSnapshot loads store.DefaultRDBPath into the server's store, if it
@@ -113,63 +107,4 @@ func (s *Server) startPeriodicSnapshot(interval time.Duration) (stop func()) {
 		}
 	}()
 	return func() { close(stopCh) }
-}
-
-// handleConn serves one client connection until it disconnects or sends
-// something this server can't parse.
-func (s *Server) handleConn(conn net.Conn) {
-	defer conn.Close()
-	reader := resp.NewReader(conn)
-
-	for {
-		req, err := reader.Read()
-		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				log.Printf("redis-clone: connection error: %v", err)
-			}
-			return
-		}
-
-		args, err := toArgs(req)
-		if err != nil {
-			writeErr(conn, err)
-			continue
-		}
-		if len(args) == 0 {
-			continue
-		}
-
-		handler := command.Lookup(args[0])
-		if handler == nil {
-			writeErr(conn, fmt.Errorf("ERR unknown command '%s'", args[0]))
-			continue
-		}
-
-		reply := handler(s.store, args[1:])
-		if _, err := conn.Write(reply.Marshal()); err != nil {
-			log.Printf("redis-clone: write error: %v", err)
-			return
-		}
-	}
-}
-
-// toArgs converts an incoming RESP value into a command name plus its
-// arguments. Clients (redis-cli included) send commands as RESP arrays of
-// bulk strings.
-func toArgs(v resp.Value) ([]string, error) {
-	if v.Type != resp.Array {
-		return nil, fmt.Errorf("ERR expected a RESP array of bulk strings, got type %q", byte(v.Type))
-	}
-	args := make([]string, len(v.Array))
-	for i, elem := range v.Array {
-		if elem.Type != resp.BulkString {
-			return nil, fmt.Errorf("ERR expected a bulk string in command array")
-		}
-		args[i] = elem.Str
-	}
-	return args, nil
-}
-
-func writeErr(w io.Writer, err error) {
-	w.Write(resp.ErrorValue(err.Error()).Marshal())
 }

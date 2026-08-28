@@ -156,6 +156,18 @@ func NewReader(r io.Reader) *Reader {
 	return &Reader{br: bufio.NewReader(r)}
 }
 
+// Buffered returns the number of bytes currently held in the Reader's
+// internal buffer that have been read from the underlying io.Reader but not
+// yet consumed by Read. Callers that feed Read a byte slice wrapped in a
+// bytes.Reader (rather than a live connection) can use
+// len(slice)-Buffered() after a successful Read to find out exactly how
+// many bytes of the slice that one Value consumed — e.g. an epoll-driven
+// event loop that accumulates raw bytes per connection and needs to know
+// how far to advance its own buffer after decoding one pipelined command.
+func (r *Reader) Buffered() int {
+	return r.br.Buffered()
+}
+
 // Read decodes and returns the next RESP value from the stream. It returns
 // io.EOF (unwrapped, so errors.Is(err, io.EOF) succeeds) when the stream
 // ends cleanly between values.

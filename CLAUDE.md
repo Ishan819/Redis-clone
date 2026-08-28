@@ -25,10 +25,13 @@ HEXISTS, HLEN, LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN, with WRONGTYPE errors), P
 (custom skip list + sorted-set commands: ZADD, ZSCORE, ZRANK, ZRANGE, ZREM, ZINCRBY),
 Phase 5 (TTL/expiry: EXPIRE, TTL, PERSIST, SET ... EX/PX, lazy + active expiry), Phase 6
 (RDB-style persistence: SAVE, BGSAVE, periodic background snapshotting, reload on
-startup), and Phase 7 (Docker packaging: multi-stage Dockerfile, docker-compose.yml with
-a persistent RDB volume) are done. See Architecture below for what exists now. Don't
-assume later phases (event loop) exist until their own commits land — check the working
-tree and update Architecture/Commands as each phase is completed.
+startup), Phase 7 (Docker packaging: multi-stage Dockerfile, docker-compose.yml with
+a persistent RDB volume), and Phase 8 (epoll-based event loop: a single-threaded,
+non-blocking `internal/eventloop` implementation on Linux, with the original
+goroutine-per-connection model kept as the portable fallback on every other OS via
+build tags) are done. See Architecture below for what exists now. Don't assume later
+phases exist until their own commits land — check the working tree and update
+Architecture/Commands as each phase is completed.
 
 ## Working conventions
 
@@ -63,6 +66,16 @@ tree and update Architecture/Commands as each phase is completed.
 - **Test one test:** `go test ./internal/resp/... -run TestReaderRead -v`
 - **Vet:** `go vet ./...`
 - **Format:** `gofmt -l .` to list unformatted files, `gofmt -w .` to fix
+- **Cross-check the Linux epoll path from macOS:** `internal/eventloop`'s epoll
+  implementation (`epoll_linux.go`) is behind a `linux` build tag, so building/testing on
+  macOS only ever exercises the goroutine-per-connection fallback
+  (`goroutine_other.go`). `GOOS=linux GOARCH=amd64 go build ./...` / `go vet ./...`
+  compile-check the epoll file, but to actually *run* it: `docker build --target builder
+  -t redis-clone-test-builder .` builds the project with the real Linux Go toolchain, then
+  `docker run --rm redis-clone-test-builder sh -c 'cd /src && go vet ./... && go test
+  ./...'` runs the full suite (including `internal/eventloop`'s tests) against the real
+  epoll implementation on Linux. `docker rmi redis-clone-test-builder` cleans up the
+  throwaway image afterward.
 - **Run in Docker (one-off container):**
   `docker build -t redis-clone .` to build the image, then
   `docker run --rm -p 6379:6379 -v redis-clone-data:/data redis-clone` to run it with a
@@ -84,8 +97,12 @@ Module: `github.com/Ishan819/Redis-clone`.
   `Value` is a tagged union (`Type` + `Str`/`Num`/`Array`/`Null` fields) covering simple
   strings, errors, integers, bulk strings, and arrays. `Value.Marshal()` encodes to wire
   bytes; `Reader` (wraps a `bufio.Reader`) decodes a stream of values one at a time via
-  `Read()`, recursing into `Read()` for array elements. This package knows nothing about
-  Redis commands — it's pure protocol.
+  `Read()`, recursing into `Read()` for array elements; `Reader.Buffered()` exposes the
+  underlying `bufio.Reader`'s buffered-byte count, letting a caller that fed `Read` a
+  byte slice (rather than a live connection) work out exactly how many bytes of that
+  slice one `Read()` call consumed — `internal/eventloop`'s epoll implementation uses
+  this to advance its own per-connection buffer past a decoded command. This package
+  knows nothing about Redis commands or networking — it's pure protocol.
 - `internal/store/` — the in-memory key-value store, independent of RESP and commands.
   `Store` wraps a `map[string]entry` guarded by a `sync.RWMutex` (one mutex for the whole
   map — fine at this scale). Each key holds a typed `entry` (`kind` — string, hash, list,
@@ -165,18 +182,57 @@ Module: `github.com/Ishan819/Redis-clone`.
   a goroutine and replies immediately — this project has no `fork()`, so "background"
   means concurrent-with-serving rather than a forked child process as real Redis uses;
   the store's own locking makes that safe).
-- `internal/server/` — the TCP front end, currently one goroutine per connection (`Server.handleConn`).
-  `Server` owns one `*store.Store`, shared by all connections. `ListenAndServe` loads
+- `internal/server/` — the TCP front end's lifecycle owner. `Server` owns one
+  `*store.Store`, shared by all connections. `ListenAndServe` binds the listener, loads
   `store.DefaultRDBPath` into the store if it exists (logging either way — a missing file
   is a normal first run, not an error), starts the active-expiry background sweep (100ms
-  interval), and starts an unconditional periodic snapshot (`startPeriodicSnapshot`,
-  60s interval — simpler than Redis's change-triggered save points, at the cost of
-  occasionally saving an unchanged dataset), stopping both on shutdown. Per connection:
-  wrap the `net.Conn` in a `resp.Reader`, loop reading a `Value`, convert it to
-  `[]string` args via `toArgs` (which enforces that a command is a RESP array of bulk
-  strings), look up the `command.Handler` and invoke it with the server's store, and
-  write the reply's `Marshal()` bytes back on the same connection. Unknown commands and
-  malformed requests get a RESP error reply rather than closing the connection.
+  interval), starts an unconditional periodic snapshot (`startPeriodicSnapshot`, 60s
+  interval — simpler than Redis's change-triggered save points, at the cost of
+  occasionally saving an unchanged dataset), and then hands the listener and store off to
+  `eventloop.Serve`, which owns the actual accept/read/dispatch loop (see
+  `internal/eventloop` below) — `ListenAndServe` doesn't know or care which of that
+  package's two build-tagged implementations it's running.
+- `internal/eventloop/` — the accept/read/dispatch loop, decoding RESP off each
+  connection and invoking `command.Lookup` + `Handler` against the shared store, same as
+  every phase before it. As of Phase 8 it has two implementations, chosen at compile time
+  by build tag on GOOS, both exporting the same `Serve(ln net.Listener, s *store.Store)
+  error`:
+  - `epoll_linux.go` (`linux`) — a single-threaded, non-blocking event loop built
+    directly on the epoll(7) syscalls. One goroutine owns one `epoll_create1` instance
+    and every connection's raw fd (pulled out of `net.Listener`/accepted connections via
+    `syscall.Conn`/`Accept4`, bypassing Go's own runtime netpoller so there's exactly one
+    readiness mechanism in play, not two stacked on each other); `epoll_wait` readiness
+    (`EPOLLIN`/`EPOLLOUT`, level-triggered) drives non-blocking `Read`/`Write` syscalls,
+    so the loop goroutine never blocks on a slow or idle client. Each connection carries
+    its own `readBuf`/`writeBuf` (`bytes.Buffer`): a RESP command split across multiple
+    TCP packets is handled by accumulating bytes into `readBuf` across `EPOLLIN` events
+    and attempting a decode (via the same `resp.Reader`, wrapped around the buffered
+    bytes) after each one — a decode that fails with `io.EOF`/`io.ErrUnexpectedEOF` means
+    "incomplete, wait for more," and a successful decode uses the new `resp.Reader.
+    Buffered()` to find exactly how many bytes it consumed so `readBuf` can advance past
+    it and try again (pipelined commands in one packet are drained the same way). Replies
+    queue in `writeBuf` and flush opportunistically; `EPOLLOUT` is registered only while a
+    write would otherwise block and dropped again once `writeBuf` drains, since a
+    level-triggered "always writable" fd would otherwise re-fire every `epoll_wait` for no
+    reason.
+  - `goroutine_other.go` (`!linux`) — the original goroutine-per-connection model
+    (Phases 1-7's `Server.handleConn`, moved here unchanged): one goroutine per
+    connection, blocking reads via `resp.Reader` directly on the `net.Conn`. This is the
+    portable fallback for every OS besides Linux — this project is developed on macOS,
+    and epoll is Linux-only (macOS/BSD's equivalent, kqueue, isn't implemented here).
+  - `eventloop.go` (no build tag) holds what both implementations share: `toArgs`
+    (converts a decoded RESP value into a command name + args, requiring a RESP array of
+    bulk strings) and the RESP-error-reply helpers, so the two implementations'
+    command-dispatch behavior — unknown commands and malformed requests get a RESP error
+    reply rather than closing the connection; a genuine RESP decode error closes the
+    connection — is shared code, not just a parallel claim in two files.
+    `eventloop_test.go` (also no build tag) runs the same black-box test suite (partial
+    commands split across writes, pipelining, unknown commands, malformed input) over a
+    real loopback connection against whichever implementation the build tag selected, so
+    "the two are behaviorally equivalent" is a tested property, not just a comment —
+    though since epoll is Linux-only, actually exercising `epoll_linux.go`'s tests
+    requires running on/in Linux (verified via `docker build --target builder` + `docker
+    run ... go test ./...`, see Commands above), not just macOS's `go test ./...`.
 - `Dockerfile` — multi-stage build. Stage 1 (`golang:1.27-alpine`, matching the Go version
   in `go.mod`) compiles a static binary (`CGO_ENABLED=0`) so the runtime stage needs no
   libc/shared libraries. Stage 2 (`alpine:3.20`, chosen over a distroless/scratch base
@@ -191,11 +247,10 @@ Module: `github.com/Ishan819/Redis-clone`.
 - `.dockerignore` — keeps the build context (and thus the image) free of `.git`, local
   build artifacts, and any stray `*.rdb` file from local testing.
 
-**Data flow:** `net.Conn` → `resp.Reader.Read()` → `[]string` args (`server.toArgs`) →
-`command.Lookup` + `Handler(store, args)` → `resp.Value` reply → `Value.Marshal()` →
-`conn.Write`.
-
-**Known future seam:** `internal/server`'s accept/read loop is expected to be replaced by an
-epoll-based event loop in a later phase; `internal/resp` and `internal/command` are designed
-to be reusable as-is when that happens, since they don't depend on how bytes arrive on the
-connection.
+**Data flow:** raw bytes on a connection → `resp.Reader.Read()` (fed either directly by a
+`net.Conn`, in the `!linux` fallback, or by a per-connection buffer accumulated across
+`epoll` readiness events, in the `linux` implementation) → `[]string` args
+(`eventloop.toArgs`) → `command.Lookup` + `Handler(store, args)` → `resp.Value` reply →
+`Value.Marshal()` → written back on the same connection. `internal/resp` and
+`internal/command` are unchanged by Phase 8's event loop rewrite, exactly as planned —
+neither package depends on how bytes arrive on the connection.
