@@ -26,12 +26,16 @@ HEXISTS, HLEN, LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN, with WRONGTYPE errors), P
 Phase 5 (TTL/expiry: EXPIRE, TTL, PERSIST, SET ... EX/PX, lazy + active expiry), Phase 6
 (RDB-style persistence: SAVE, BGSAVE, periodic background snapshotting, reload on
 startup), Phase 7 (Docker packaging: multi-stage Dockerfile, docker-compose.yml with
-a persistent RDB volume), and Phase 8 (epoll-based event loop: a single-threaded,
+a persistent RDB volume), Phase 8 (epoll-based event loop: a single-threaded,
 non-blocking `internal/eventloop` implementation on Linux, with the original
 goroutine-per-connection model kept as the portable fallback on every other OS via
-build tags) are done. See Architecture below for what exists now. Don't assume later
-phases exist until their own commits land — check the working tree and update
-Architecture/Commands as each phase is completed.
+build tags), and Phase 9 (benchmarking + README: `redis-benchmark` GET/SET throughput
+measured against the real epoll build in a Linux container at 50 and 500 concurrent
+clients, results saved under `benchmarks/`, and a top-level `README.md` covering
+architecture, commands, build/run/test instructions, and design tradeoffs) are done.
+See Architecture below for what exists now. Don't assume later phases exist until
+their own commits land — check the working tree and update Architecture/Commands as
+each phase is completed.
 
 ## Working conventions
 
